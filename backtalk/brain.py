@@ -29,8 +29,10 @@ only the spoken-delivery discipline (config.DISCIPLINE): the medium,
 never the character.
 """
 import asyncio
+import json
 import os
 import re
+import time
 import warnings
 from datetime import datetime
 
@@ -49,11 +51,30 @@ _SENTENCE_END = re.compile(r"(?<=[.!?])\s")
 
 
 SESSION_FILE = os.path.join(CFG["signals_dir"], ".backtalk_session")
+# Durable companion to SESSION_FILE: started_at/last_activity/
+# last_input_tokens, used by main.py's launch-time resume check.
+# SESSION_FILE's own mtime is useless for that -- it gets rewritten on
+# every completed turn, so a conversation that just never restarts
+# always looks "today" no matter how old or huge it's gotten. Root
+# cause of the 2026-10-05 five-hour-limit incident: an un-relaunched
+# overnight session kept resuming its own ballooning history past the
+# old launch-only day check. See the Jarvis Stack Runbook for the full
+# incident.
+SESSION_META_FILE = os.path.join(CFG["signals_dir"],
+                                 ".backtalk_session_meta.json")
+# 2026-10-12: Patrick decided the mid-session auto-recycle (both the
+# new-day and idle-duration triggers) was costing more in lost context
+# than it saved -- he'd rather notice and say "clear"/"compact" himself.
+# brain.py no longer recycles on its own. This constant survives only
+# because main.py's own launch-time resume check (a separate, one-time
+# decision: reattach to a saved session or start clean) still uses it.
+_STALE_IDLE_SECONDS = 2 * 60 * 60
+# Token counts are retained for reporting, never used to force a reset.
 
 
 class WarmBrain:
     def __init__(self, model: str | None = None, can_use_tool=None,
-                 resume_id: str | None = None):
+                 resume_id: str | None = None, resume_meta: dict | None = None):
         # Full model id ON PURPOSE — never a bare alias. The SDK
         # resolves aliases through its own bundled CLI and can silently
         # land on an older model.
@@ -72,11 +93,26 @@ class WarmBrain:
         # went sideways mid-stream, the wrong moment to gamble on
         # reattaching. (Community proposal, issue #1.)
         self._resume_id = resume_id
+        # main.py's pre-loaded SESSION_META_FILE contents for resume_id,
+        # if it decided resuming was still safe. Applied once in
+        # start(), then dropped -- same consume-on-use shape as
+        # _resume_id, for the same reason (a rebuild must never inherit
+        # a stale clock).
+        self._resume_meta = resume_meta
+        # The staleness guard's own clock: when THIS conversation
+        # (fresh or resumed) actually started, when its last turn
+        # finished, and how much context that turn carried. Defaults
+        # assume fresh; overwritten from _resume_meta in start() if
+        # resuming.
+        self._session_started = time.time()
+        self._last_activity = None
+        self._last_input_tokens = 0
         # True while a query's response hasn't been consumed through its
         # ResultMessage — i.e. the shared message pipe may hold leftovers.
         self._dirty = False
 
     async def start(self):
+        signals.set_context_usage(None)
         mode = CFG["permission_mode"]
         if mode == "default":
             mode = "ask"     # legacy alias, see config.py
@@ -98,6 +134,7 @@ class WarmBrain:
                 system_prompt={"type": "preset", "preset": "claude_code",
                                "append": DISCIPLINE},
                 include_partial_messages=True,
+                max_buffer_size=16 * 1024 * 1024,
                 permission_mode=sdk_mode,
                 can_use_tool=self._can_use_tool,
                 add_dirs=CFG["extra_dirs"],
@@ -108,7 +145,14 @@ class WarmBrain:
             try:
                 self._client = ClaudeSDKClient(options=_opts(resume))
                 await self._client.connect()
+                meta, self._resume_meta = self._resume_meta, None  # consume once
+                if meta:
+                    self._session_started = meta.get("started_at",
+                                                      self._session_started)
+                    self._last_activity = meta.get("last_activity")
+                    self._last_input_tokens = meta.get("last_input_tokens", 0)
                 log(f"[brain] resumed session {resume[:8]}")
+                await self._publish_context_usage()
                 return
             except Exception as e:
                 # a stale or invalid saved session must never brick the
@@ -119,8 +163,15 @@ class WarmBrain:
                     await self._client.disconnect()
                 except Exception:
                     pass
+        # Fresh conversation: never inherit a stale clock from a resume
+        # attempt that didn't pan out.
+        self._resume_meta = None
+        self._session_started = time.time()
+        self._last_activity = None
+        self._last_input_tokens = 0
         self._client = ClaudeSDKClient(options=_opts(None))
         await self._client.connect()
+        await self._publish_context_usage()
 
     async def set_permission_mode(self, backtalk_mode: str):
         """Live flip, no reconnect, conversation intact ("ask" maps to
@@ -137,20 +188,59 @@ class WarmBrain:
         except Exception:
             return None
 
+    async def _publish_context_usage(self):
+        """A bounded control query, not a new model turn or an auto-reset."""
+        if not CFG.get("show_usage"):
+            signals.set_context_usage(None)
+            return
+        try:
+            usage = await asyncio.wait_for(self.context_usage(), 2)
+        except Exception:
+            usage = None
+        signals.set_context_usage(usage)
+
     def _remember_session(self, rm):
         """Persist the session id after a completed turn, so the next
-        launch can reattach (config: resume_last_session). Must never
-        break a turn; silence on any failure."""
+        launch can reattach (config: resume_last_session). Also updates
+        the staleness guard's own durable clock (SESSION_META_FILE) --
+        unlike SESSION_FILE's mtime, started_at is never overwritten by
+        this, which is the whole point: it has to survive every
+        completed turn unchanged so a conversation's true age stays
+        knowable. Must never break a turn; silence on any failure."""
         if not CFG.get("resume_last_session"):
             return
         sid = getattr(rm, "session_id", None)
         if not sid:
             return
+        self._last_activity = time.time()
+        self._last_input_tokens = self._measured_input_tokens(rm)
         try:
             with open(SESSION_FILE, "w") as f:
                 f.write(sid)
+            with open(SESSION_META_FILE, "w") as f:
+                json.dump({
+                    "session_id": sid,
+                    "started_at": self._session_started,
+                    "last_activity": self._last_activity,
+                    "last_input_tokens": self._last_input_tokens,
+                }, f)
         except OSError:
             pass
+
+    @staticmethod
+    def _measured_input_tokens(rm) -> int:
+        """Total measured input context on a completed turn: live input
+        plus whatever the prompt cache read or had to recreate. The
+        proxy the staleness guard sizes a carried conversation by --
+        not a claim about Anthropic's actual quota formula, which isn't
+        published."""
+        try:
+            u = getattr(rm, "usage", None) or {}
+            return (int(u.get("input_tokens") or 0)
+                    + int(u.get("cache_read_input_tokens") or 0)
+                    + int(u.get("cache_creation_input_tokens") or 0))
+        except Exception:
+            return 0
 
     def _tally(self, rm, count_turn=True):
         """Session usage bookkeeping. Must never break a turn."""
@@ -226,6 +316,8 @@ class WarmBrain:
         here would deafen the whole voice loop. On timeout the pipe is
         left marked dirty so the next reset_turn drains or rebuilds."""
         self._dirty = True
+        # Clear/compact/model commands may change the context or its capacity.
+        signals.set_context_usage(None)
         await self._client.query(cmd)
         texts = []
 
@@ -248,6 +340,7 @@ class WarmBrain:
         except asyncio.TimeoutError:
             log(f"[brain] console command timed out: {cmd!r}")
             return "error: the command timed out"
+        await self._publish_context_usage()
         return " ".join(texts).strip()
 
     async def interrupt(self):
@@ -281,8 +374,10 @@ class WarmBrain:
             async for msg in self._client.receive_response():
                 n += 1
                 if type(msg).__name__ == "ResultMessage":
-                    break
-            return n
+                    return n
+            # EOF is not recovery: the SDK reader may have died before
+            # emitting the result that makes the shared pipe safe again.
+            raise RuntimeError("Response stream ended without ResultMessage")
 
         try:
             drained = await asyncio.wait_for(_drain(), timeout)
@@ -295,25 +390,54 @@ class WarmBrain:
             # rest of the day.
             log("[brain] stream desynced beyond repair — rebuilding the "
                 "session (conversation memory for this session resets)")
+            # Invalidate the failed conversation before reconnecting so
+            # even an unsuccessful rebuild cannot resume it at launch.
+            for path in (SESSION_FILE, SESSION_META_FILE):
+                try:
+                    os.remove(path)
+                except FileNotFoundError:
+                    pass
+            self._resume_id = None
             try:
-                await self._client.disconnect()
+                await asyncio.wait_for(self._client.disconnect(), 5)
             except Exception:
                 pass
             self._client = None
-            await self.start()
+            self._resume_meta = None
+            self._session_started = time.time()
+            self._last_activity = None
+            self._last_input_tokens = 0
+            await asyncio.wait_for(self.start(), 20)
             self._dirty = False
+            return True  # caller must disclose that conversation was reset
 
     async def stop(self):
+        signals.set_context_usage(None)
         if self._client:
             await self._client.disconnect()
             self._client = None
 
     async def ask_stream(self, utterance: str):
         """Yield complete sentences as they stream out of the model."""
+        # 2026-10-12: no more automatic mid-session recycling here --
+        # Patrick's own "clear"/"compact" commands are the only thing
+        # that resets this conversation now. See _STALE_IDLE_SECONDS.
         self._dirty = True             # in flight until its ResultMessage
         await self._client.query(utterance)
         buf = ""
         async for msg in self._client.receive_response():
+            # Reassert "thinking" on every raw stream message, tool calls
+            # included. This is deliberately NOT the can_use_tool gate
+            # (main.py's gate()) -- found 2026-09-02 that the SDK silently
+            # shadows that callback entirely in bypassPermissions/autoapprove
+            # mode, so a reassertion living only there never fires in normal
+            # operation. The raw message stream isn't gated by permission
+            # mode at all, so hooking here actually closes the gap: mouth.py
+            # legitimately goes idle between sentences of the same reply
+            # (upstream's own documented behavior, see signals.reply_done),
+            # and without this, that idle sits stale through any real work
+            # -- tool calls, reasoning -- happening in that gap.
+            signals.set_state("thinking")
             t = type(msg).__name__
             if t == "StreamEvent":
                 ev = getattr(msg, "event", {}) or {}
@@ -346,6 +470,7 @@ class WarmBrain:
                 self._tally(msg)
                 self._remember_session(msg)
                 await self._pull_rate_limits()
+                await self._publish_context_usage()
                 break
         tail = buf.strip()
         if tail:

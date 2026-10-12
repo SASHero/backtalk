@@ -25,6 +25,8 @@ is the whole integration surface:
   .voice_loading_pid  exists while the thinking sound is playing
   .voice_rate_limits  JSON {window: {utilization, resets_at}} — only
                       written when show_usage is on
+  .voice_context      JSON {percentage, used, max, ts}; null percentage
+                      means no current context reading
 
 Written to signals_dir (default: the repo root). Visualizers built on
 this contract just work.
@@ -37,6 +39,7 @@ its format (state/state as a bare word, state/wave.json normalized
 Every write is wrapped: the bus must never crash the voice line.
 """
 import json
+import math
 import os
 import subprocess
 import sys
@@ -53,6 +56,7 @@ _LOADING_PID_FILE = os.path.join(_DIR, ".voice_loading_pid")
 _DIRECTION_FILE = os.path.join(_DIR, ".voice_direction")
 _REPLY_DONE_FILE = os.path.join(_DIR, ".voice_reply_done")
 _RATE_LIMIT_FILE = os.path.join(_DIR, ".voice_rate_limits")
+_CONTEXT_FILE = os.path.join(_DIR, ".voice_context")
 
 _BH = CFG.get("barehands_state_dir") or ""
 _BH_STATE = os.path.join(_BH, "state") if _BH else ""
@@ -171,6 +175,36 @@ def set_rate_limit(window: str, utilization, resets_at):
         with open(_RATE_LIMIT_FILE, "w") as f:
             f.write(json.dumps(_rate_limits))
     except OSError:
+        pass
+
+
+def get_rate_limits() -> dict:
+    """Read back the last known reading per window -- {} if show_usage
+    has never run, the file doesn't exist yet, or anything goes wrong.
+    Never raises."""
+    try:
+        with open(_RATE_LIMIT_FILE) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def set_context_usage(usage):
+    """Publish the SDK's context reading, or unknown. Never break speech."""
+    payload = {"percentage": None, "ts": time.time()}
+    try:
+        if isinstance(usage, dict):
+            pct = usage.get("percentage")
+            if (isinstance(pct, (int, float)) and not isinstance(pct, bool)
+                    and math.isfinite(pct) and 0 <= pct <= 100):
+                payload.update(percentage=pct,
+                               used=usage.get("totalTokens"),
+                               max=usage.get("maxTokens"))
+        # Replace as one operation so readers never see half a JSON document.
+        with open(_CONTEXT_FILE + ".tmp", "w") as f:
+            json.dump(payload, f, allow_nan=False)
+        os.replace(_CONTEXT_FILE + ".tmp", _CONTEXT_FILE)
+    except (OSError, ValueError, TypeError):
         pass
 
 

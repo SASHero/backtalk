@@ -54,11 +54,13 @@ Say "goodbye <name>" / "end voice mode" to hang up. Ctrl-C works.
 """
 import asyncio
 import json
+import os
 import queue
 import re
 import socket
 import sys
 import threading
+import traceback
 import time
 
 from backtalk import signals
@@ -104,6 +106,13 @@ _AUTOAPPROVE = {"on": False}
 # open-mic capture from before the switch gets discarded, never
 # processed.
 _MIC = {"mode": "ptt", "gen": 0, "btn": False}
+# Whether a Discord-originated turn gets spoken. On by default (Patrick's
+# often within earshot of the desk speaker even while texting Discord a
+# few feet away) but toggleable live, from the desk or from Discord
+# itself since a Discord message is already a real turn through this
+# same console-command path. Local voice/typed turns always speak
+# regardless -- this only ever gates the Discord-origin case.
+_DISCORD_VOICE = {"on": bool(CFG.get("discord_voice", True))}
 
 # Approvals are EXACT matches after normalization, never prefixes:
 # "yesterday", "yes or no", and "yes, but do not overwrite" must all
@@ -215,6 +224,12 @@ def make_permission_gate(mouth):
                                   PermissionResultDeny)
 
     async def gate(tool, tool_input, ctx):
+        # Re-assert "thinking" on every tool call, autoapprove included.
+        # Without this, a long stretch of silent tool use (no spoken
+        # output yet) can outlast whatever last set the state, and the
+        # face is left showing something stale — reported 2026-08-31 as
+        # looking like "idle" during real, visible work.
+        signals.set_state("thinking")
         if _AUTOAPPROVE["on"]:
             return PermissionResultAllow(behavior="allow")
         what = _human_what(tool, tool_input, ctx)
@@ -325,6 +340,12 @@ CONSOLE_VERBS = {
                   "auto approve mode"),
     "ask":       ("start asking again", "ask before acting",
                   "ask for permission again"),
+    "discordvoiceoff": ("mute discord", "quiet on discord",
+                        "turn off discord voice",
+                        "turn discord voice off"),
+    "discordvoiceon":  ("unmute discord", "speak on discord",
+                        "turn on discord voice",
+                        "turn discord voice on"),
 }
 _EFFORTS = ("low", "medium", "high", "xhigh", "max")
 
@@ -394,6 +415,16 @@ def _spoken_usage(sess, ctx_usage):
         if total:
             parts.append(_fmt_tokens(total)
                          + " sitting in the context window")
+    except Exception:
+        pass
+    try:
+        limits = signals.get_rate_limits()
+        for window, label in _RATE_LIMIT_WINDOW_LABELS.items():
+            w = limits.get(window) or {}
+            pct = w.get("utilization")
+            if pct is not None:
+                parts.append(f"{label} at {round(pct * 100)} percent, "
+                             f"resets in {_humanize_reset(w.get('resets_at'))}")
     except Exception:
         pass
     return ". ".join(parts) + "."
@@ -579,14 +610,161 @@ def _typed_reader(q: "queue.Queue[str]"):
                 sys.stdout.flush()
 
 
-async def speak_reply(brain: WarmBrain, mouth: Mouth, text: str):
+def _bridge_reader(q: "queue.Queue[str]", path: str):
+    """Tails a plain text file for lines written by an external bridge
+    (e.g. the Discord relay) and feeds them into the SAME typed-input
+    queue the console uses -- a bridge message is a first-class turn,
+    exactly like typing or talking, not a separate session. This is the
+    deliberate alternative to `/remote-control`'s mistake: that spawns a
+    second, independent Claude Code session; this reaches the one
+    already running.
+
+    Polls rather than a filesystem-watch API -- this file changes at
+    most a few times a minute, so a cheap 1s poll costs nothing and adds
+    no new dependency. Matches signals.py's own established pattern:
+    external programs talk to backtalk through plain files, nothing
+    fancier."""
+    import os
+    import time
+    pos = os.path.getsize(path) if os.path.exists(path) else 0
+    while True:
+        try:
+            if os.path.exists(path):
+                size = os.path.getsize(path)
+                if size > pos:
+                    with open(path, "r", encoding="utf-8") as f:
+                        f.seek(pos)
+                        new = f.read()
+                        pos = f.tell()
+                    for line in new.splitlines():
+                        line = line.strip()
+                        if line:
+                            # \x01 marks this turn as Discord-origin: muted,
+                            # no TTS synthesis or playback, since nobody's
+                            # at the desk to hear it. Text output (log(),
+                            # which the bridge tails back to Discord) is
+                            # unaffected -- only the mouth.say_chunk() calls
+                            # in speak_reply() get skipped. Stripped back
+                            # off where a turn is picked up off the queue.
+                            q.put("\x01" + line)
+                elif size < pos:
+                    pos = 0     # file truncated/rotated externally -- restart
+        except OSError:
+            pass
+        time.sleep(1.0)
+
+
+# The face's "AUDIO ON/OFF" button (ai-visualizer/server.py's /mute
+# endpoint) writes "1"/"0" here. This is the one write direction on an
+# otherwise read-only bus -- server.py's own docstring calls that out.
+_FACE_MUTE = {"on": False}
+
+
+def _face_mute_watcher(path: str, mouth):
+    """Polls the mute-request file and mirrors it into _FACE_MUTE.
+    A quarter-second poll (vs. _bridge_reader's 1s) because a button
+    click is interactive -- someone's looking at the screen waiting for
+    it to take effect, not typing into a queue that fills a few times a
+    minute. On a transition TO muted, cuts whatever is playing right
+    now via mouth.shut_up() -- clicking the button while I'm mid-sentence
+    should cut me off immediately, not just gate the next reply."""
+    last = False
+    while True:
+        try:
+            if os.path.exists(path):
+                with open(path, encoding="utf-8") as f:
+                    muted = f.read().strip() == "1"
+            else:
+                muted = False
+        except OSError:
+            muted = last
+        if muted and not last:
+            mouth.shut_up()
+        _FACE_MUTE["on"] = muted
+        last = muted
+        time.sleep(0.25)
+
+
+_RATE_LIMIT_WARN_THRESHOLD = 0.85   # fraction of a window spent before we say anything
+_rate_limit_warned: set = set()     # windows already warned about this process -- once each
+_RATE_LIMIT_WINDOW_LABELS = {"five_hour": "the 5-hour limit",
+                              "seven_day": "the weekly limit"}
+
+
+def _humanize_reset(resets_at) -> str:
+    """A unix epoch -> 'about 3 hours' style, for the ear. None-safe."""
+    if not resets_at:
+        return "soon"
+    delta = resets_at - time.time()
+    if delta <= 0:
+        return "any moment"
+    minutes = max(1, round(delta / 60))     # round once, then decide the unit
+    if minutes < 60:
+        return f"about {minutes} minute" + ("" if minutes == 1 else "s")
+    hours = round(minutes / 60)
+    if hours < 24:
+        return f"about {hours} hour" + ("" if hours == 1 else "s")
+    days = round(hours / 24)
+    return f"about {days} day" + ("" if days == 1 else "s")
+
+
+def _check_rate_limit_warning() -> str | None:
+    """A spoken heads-up the first time a usage window crosses the
+    threshold this process, else None. Reads whatever brain.py's
+    _pull_rate_limits() last wrote -- {} (silently) if show_usage is
+    off, so this is a true no-op until that's turned on."""
+    limits = signals.get_rate_limits()
+    for window, label in _RATE_LIMIT_WINDOW_LABELS.items():
+        if window in _rate_limit_warned:
+            continue
+        w = limits.get(window) or {}
+        pct = w.get("utilization")
+        if pct is None or pct < _RATE_LIMIT_WARN_THRESHOLD:
+            continue
+        _rate_limit_warned.add(window)
+        return (f"Heads up, Major — at {round(pct * 100)}% of {label}, "
+                f"could go quiet any moment now. If it does, expect it back "
+                f"in {_humanize_reset(w.get('resets_at'))}.")
+    return None
+
+
+async def speak_reply(brain: WarmBrain, mouth: Mouth, text: str, mute: bool = False):
     """First sentence ships alone (fast start); the rest go in
     2-sentence breaths — fuller chunks get livelier prosody (single
-    short sentences come out flat)."""
+    short sentences come out flat).
+
+    mute alone no longer silences playback -- Patrick's often within
+    earshot of the desk speaker even while texting Discord from a few
+    feet away, so muting on Discord-origin alone was the wrong signal.
+    It still drives the [you:discord] log tag handle() uses (the bridge
+    relies on that to avoid echoing Patrick's own Discord messages back
+    at him), and it combines with the live "mute discord" / "unmute
+    discord" toggle (_DISCORD_VOICE) to decide playback: a Discord-origin
+    turn stays silent only while that toggle is off. Local voice/typed
+    turns always speak regardless of the toggle. Real history: built
+    2026-09-0X to always mute Discord turns, reversed 2026-09-07 once
+    that assumption turned out not to hold in practice, then made a live
+    toggle the same night instead of hardcoding either direction."""
     t0 = time.time()
     first = True
     batch: list[str] = []
     pending: list[str] = []          # directions waiting for their chunk
+    said_over = False    # did any chunk this turn actually say "over to you"?
+    silent = (mute and not _DISCORD_VOICE["on"]) or _FACE_MUTE["on"]
+
+    def mark_over(s: str):
+        nonlocal said_over
+        # Only counts if "over to you" is acting as the actual closer -- the
+        # phrase itself is short-lived once it's followed by a name and/or
+        # punctuation, nothing else. A mention of it mid-explanation (talking
+        # ABOUT the convention, e.g. this exact block of code) has a real
+        # sentence trailing after it and must not count -- found 2026-09-03
+        # after a conversation about the "over to you" mechanism itself
+        # false-triggered this exact check and silenced the safety net.
+        lower = s.lower()
+        idx = lower.rfind("over to you")
+        if idx != -1 and len(s[idx + len("over to you"):].strip()) <= 20:
+            said_over = True
 
     def emit(raw: str):
         nonlocal first, batch, pending
@@ -608,14 +786,19 @@ async def speak_reply(brain: WarmBrain, mouth: Mouth, text: str):
         if first:
             log(f"[{NAME}] ({time.time()-t0:.1f}s to first) {s}"
                 + (f"  <directions: {pending}>" if pending else ""))
-            mouth.say_chunk(s, pending)
+            mark_over(s)
+            if not silent:
+                mouth.say_chunk(s, pending)
             pending = []
             first = False
         else:
             log(f"[{NAME}] {s}" + (f"  <directions: {pending}>" if pending else ""))
             batch.append(s)
             if len(batch) >= 2:
-                mouth.say_chunk(" ".join(batch), pending)
+                joined = " ".join(batch)
+                mark_over(joined)
+                if not silent:
+                    mouth.say_chunk(joined, pending)
                 pending = []
                 batch = []
 
@@ -623,8 +806,39 @@ async def speak_reply(brain: WarmBrain, mouth: Mouth, text: str):
         async for sentence in brain.ask_stream(text):
             emit(sentence)
         if batch:
-            mouth.say_chunk(" ".join(batch), pending)
+            joined = " ".join(batch)
+            mark_over(joined)
+            if not silent:
+                mouth.say_chunk(joined, pending)
             pending = []
+        if not first:
+            warning = _check_rate_limit_warning()
+            if warning:
+                log(f"[{NAME}] {warning}")
+                if not silent:
+                    mouth.say_chunk(warning)
+        if not first and not said_over:
+            # Safety net: the turn genuinely ended without the "over to you"
+            # cue -- rather than rely on remembering to say it every single
+            # time, guarantee the text signal always appears. See CLAUDE.md's
+            # "over to you" rule.
+            log(f"[{NAME}] Over to you.")
+            if not silent:
+                mouth.say_chunk("Over to you.")
+        if silent and not first:
+            # Real bug found live 2026-09-05, reintroduced live 2026-09-07
+            # once "mute discord" made silence possible again: state.set
+            # ("idle")/reply_done() both live INSIDE mouth.py's own
+            # playback loop, firing only once real audio actually
+            # finishes. A silent turn skips every mouth.say_chunk() call,
+            # so that code path never runs -- state would freeze on
+            # whatever it was mid-turn (usually "thinking") forever, and
+            # since the bridge polls that same file for Discord's typing
+            # indicator, it'd keep firing indefinitely. Silencing skips
+            # PLAYBACK; it was never meant to also skip the state reset
+            # that playback happens to be responsible for.
+            signals.static_stop()
+            signals.set_state("idle")
         if first:
             # Zero sentences yielded (brain error / empty turn): nothing
             # will ever dequeue, so nothing resets the bus — park it here.
@@ -636,6 +850,46 @@ async def speak_reply(brain: WarmBrain, mouth: Mouth, text: str):
         except Exception:
             pass
         raise
+    except Exception as e:
+        # A crash mid-reply (e.g. the SDK's message reader hitting its
+        # hard 1MB per-message buffer cap on an oversized tool result --
+        # a full-page browser screenshot was the live trigger, 2026-09-21/
+        # 22) used to die completely silent: everything above this point
+        # in the try block never gets a chance to run, so nothing spoke,
+        # state never left "thinking", and only a hard process restart
+        # recovered. Found and fixed live 2026-09-22.
+        log(f"[brain] speak_reply crashed mid-turn: {e!r}")
+        signals.static_stop()
+        signals.set_state("idle")
+        reason = ("The file or tool response exceeded my message-size limit. "
+                  if "maximum buffer size" in str(e)
+                  else "An internal error interrupted that reply. ")
+        notice = reason + "I'm checking the connection now."
+        log(f"[Jarvis] {notice}")
+        if not silent:
+            try:
+                mouth.say_chunk(notice)
+            except Exception as voice_error:
+                log(f"[brain] recovery warning voice failed: {voice_error!r}")
+        try:
+            rebuilt = await brain.reset_turn()
+        except Exception as recovery_error:
+            log(f"[brain] crash recovery failed: {recovery_error!r}")
+            notice = ("I couldn't restore the connection. Close and relaunch "
+                      "Jarvis before sending another request. Don't resend "
+                      "the same file yet. Over to you.")
+        else:
+            notice = (("I started a fresh conversation to recover. "
+                       if rebuilt else "The connection is ready again. ")
+                      + "The failed request "
+                      "wasn't retried. Send your next instruction; for a "
+                      "PDF, ask me to extract its text first. Over to you.")
+        log(f"[Jarvis] {notice}")
+        if not silent:
+            try:
+                mouth.say_chunk(notice)
+            except Exception as voice_error:
+                log(f"[brain] recovery warning voice failed: {voice_error!r}")
 
 
 async def amain():
@@ -652,21 +906,56 @@ async def amain():
     _AUTOAPPROVE["on"] = CFG_BOOT_MODE == "bypassPermissions"
     _MIC["mode"] = "open" if (open_mic
                               or CFG.get("mic_mode") == "open") else "ptt"
-    # resume_last_session: reattach to the saved conversation, if any
+    # resume_last_session: reattach to the saved conversation, if any --
+    # but only when SESSION_META_FILE's own durable clock says it's
+    # still fresh. NOT SESSION_FILE's mtime: that gets rewritten on
+    # every completed turn, so a conversation that simply never
+    # restarts always looks "today" no matter how old or huge it's
+    # gotten -- confirmed root cause of the 2026-10-05 five-hour-limit
+    # incident, where a relaunch resumed the exact session it was meant
+    # to escape because its mtime had just been refreshed minutes
+    # earlier. A resumed conversation resends its entire growing
+    # history on every single turn, so letting it chain stale compounds
+    # a real, ever-larger token cost with nothing to show for it. Vault
+    # memory (daily notes, Active Priorities) is the durable record
+    # across days; the resumed conversation is only meant to spare
+    # same-day restarts the cold-start vault-read toll. This is the
+    # launch-time half of the guard; brain.py's WarmBrain re-checks the
+    # identical age/idle conditions before every single turn, since a
+    # session that never relaunches at all never hits this code path.
+    # Found and reasoned through live 2026-09-07, sharpened 2026-10-05
+    # -- see CLAUDE.md's Startup Sequence and the Jarvis Stack Runbook.
     resume_id = None
+    resume_meta = None
     if CFG.get("resume_last_session"):
         try:
-            from backtalk.brain import SESSION_FILE
-            with open(SESSION_FILE) as f:
-                resume_id = f.read().strip() or None
-        except OSError:
+            from backtalk.brain import (SESSION_FILE, SESSION_META_FILE,
+                                        _STALE_IDLE_SECONDS)
+            import datetime
+            with open(SESSION_META_FILE) as f:
+                meta = json.load(f)
+            started = datetime.datetime.fromtimestamp(meta["started_at"])
+            last_activity = meta.get("last_activity")
+            stale = (
+                started.date() != datetime.date.today()
+                or last_activity is None
+                or (time.time() - last_activity) >= _STALE_IDLE_SECONDS
+            )
+            if not stale:
+                with open(SESSION_FILE) as f:
+                    resume_id = f.read().strip() or None
+                resume_meta = meta if resume_id else None
+            # else: missing metadata or an old/idle session --
+            # start fresh on purpose rather than gamble on reattaching.
+        except (OSError, ValueError, KeyError, json.JSONDecodeError):
             resume_id = None
+            resume_meta = None
 
     mouth = Mouth()
     ears = Ears()
     brain = WarmBrain(model=model,
                       can_use_tool=make_permission_gate(mouth),
-                      resume_id=resume_id)
+                      resume_id=resume_id, resume_meta=resume_meta)
 
     mode = ("hands-free listening (the talk key still works)"
             if _MIC["mode"] == "open"
@@ -721,7 +1010,33 @@ async def amain():
     speak_task: asyncio.Task | None = None
     typed_q: "queue.Queue[str]" = queue.Queue()
     threading.Thread(target=_typed_reader, args=(typed_q,), daemon=True).start()
+    # The Discord bridge (or any future external relay) writes lines here;
+    # they arrive as first-class turns on the SAME queue console input
+    # uses, in this SAME running session -- see _bridge_reader's own
+    # docstring for why that distinction matters.
+    _bridge_inbox = os.path.join(CFG["signals_dir"], ".bridge_inbox")
+    threading.Thread(target=_bridge_reader, args=(typed_q, _bridge_inbox),
+                      daemon=True).start()
+    # The face's "AUDIO ON/OFF" button -- see _face_mute_watcher's own
+    # docstring and ai-visualizer/server.py's /mute endpoint.
+    _mute_request_path = os.path.join(CFG["signals_dir"], ".voice_mute_request")
+    threading.Thread(target=_face_mute_watcher,
+                      args=(_mute_request_path, mouth), daemon=True).start()
     typed_fut: asyncio.Future | None = None
+
+    def _say(text: str):
+        """Speak a console-verb confirmation AND log it as a [Jarvis]
+        line. These used to call mouth.say() directly, which speaks
+        locally but writes nothing the Discord bridge can see -- it
+        only relays lines tagged [Jarvis]. Found 2026-09-08: Patrick
+        said "unmute discord" from his phone, heard nothing (he wasn't
+        near the speaker), and had no way to tell it landed since no
+        text ever showed up on Discord either. Also respects the face's
+        AUDIO OFF button (_FACE_MUTE) -- muted means muted, console
+        confirmations included, same as a real reply would be."""
+        if not _FACE_MUTE["on"]:
+            mouth.say(text)
+        log(f"[Jarvis] {text}")
 
     async def run_console(verb):
         """One voice-console verb. The current reply was already
@@ -732,7 +1047,7 @@ async def amain():
             await _run_console_inner(verb)
         except Exception as e:
             log(f"[console] {verb} failed: {e}")
-            mouth.say("That command hit an error. Check the log.")
+            _say("That command hit an error. Check the log.")
             signals.set_state("idle")
 
     async def _run_console_inner(verb):
@@ -743,13 +1058,13 @@ async def amain():
             resp = await brain.command("/clear")
             say_after = "Cleared. Fresh slate."
         elif verb == "compact":
-            mouth.say("Compacting. One moment.")
+            _say("Compacting. One moment.")
             resp = await brain.command("/compact")
             say_after = "Compacted. Same conversation, smaller footprint."
         elif verb == "deep":
-            mouth.say("Switching to the deep model. Heads up, replies "
-                      "get slower. Say back to the fast model when "
-                      "you're done.")
+            _say("Switching to the deep model. Heads up, replies "
+                 "get slower. Say back to the fast model when "
+                 "you're done.")
             resp = await brain.command(f"/model {CFG['deep_model']}")
             say_after = "Deep model online, for this session only."
         elif verb == "fast":
@@ -766,41 +1081,41 @@ async def amain():
                          "stick past a restart.")
         elif verb == "usage":
             resp = ""
-            mouth.say(_spoken_usage(brain.session,
-                                    await brain.context_usage()))
+            _say(_spoken_usage(brain.session,
+                               await brain.context_usage()))
         elif verb == "micopen":
             resp = ""
             if _MIC["mode"] == "open":
-                mouth.say("Already in hands-free listening.")
+                _say("Already in hands-free listening.")
             else:
                 _MIC["mode"] = "open"
                 _MIC["gen"] += 1
                 _write_config_key("mic_mode", "open")
                 log("[console] mic_mode -> open (hands-free listening)")
-                mouth.say("Hands-free listening on. I'm always "
-                          "listening now, so anything said in the room "
-                          "can reach me. The talk key still works, and "
-                          "holding it always gets you heard. Say push "
-                          "to talk mode to bring the button back.")
+                _say("Hands-free listening on. I'm always "
+                     "listening now, so anything said in the room "
+                     "can reach me. The talk key still works, and "
+                     "holding it always gets you heard. Say push "
+                     "to talk mode to bring the button back.")
         elif verb == "micptt":
             resp = ""
             if _MIC["mode"] == "ptt":
-                mouth.say("Already on push to talk.")
+                _say("Already on push to talk.")
             else:
                 _MIC["mode"] = "ptt"
                 _MIC["gen"] += 1
                 _write_config_key("mic_mode", "ptt")
                 log("[console] mic_mode -> ptt")
                 key = str(CFG.get("ptt_key", "home")).replace("_", " ")
-                mouth.say(f"Push to talk. Hold the {key} key and "
-                          "talk; the mic stays closed otherwise.")
+                _say(f"Push to talk. Hold the {key} key and "
+                     "talk; the mic stays closed otherwise.")
         elif verb == "noask":
             resp = ""
             _CONFIRM["verb"] = "noask"
             _CONFIRM["at"] = time.monotonic()
-            mouth.say("Auto-approve means I act without asking "
-                      "permission, and it becomes your saved default. "
-                      "Say confirm to switch.")
+            _say("Auto-approve means I act without asking "
+                 "permission, and it becomes your saved default. "
+                 "Say confirm to switch.")
         elif verb == "noask:confirmed":
             resp = ""
             saved = _write_config_key("permission_mode",
@@ -808,13 +1123,13 @@ async def amain():
             _AUTOAPPROVE["on"] = True
             log("[console] permission_mode -> bypassPermissions"
                 + (" (saved)" if saved else " (session only)"))
-            mouth.say(("Auto-approve on, and saved as your default. "
-                       if saved else
-                       "Auto-approve on for this session. The config "
-                       "file couldn't be written, so it won't stick "
-                       "past a restart. ")
-                      + "Say start asking again any time to flip it "
-                        "back.")
+            _say(("Auto-approve on, and saved as your default. "
+                  if saved else
+                  "Auto-approve on for this session. The config "
+                  "file couldn't be written, so it won't stick "
+                  "past a restart. ")
+                 + "Say start asking again any time to flip it "
+                   "back.")
         elif verb == "ask":
             resp = ""
             saved = _write_config_key("permission_mode", "ask")
@@ -833,16 +1148,47 @@ async def amain():
             log("[console] permission_mode -> ask"
                 + (" (saved)" if saved else " (session only)"))
             if flipped:
-                mouth.say("Done. I'll ask out loud before real "
-                          "actions"
-                          + (", and that's saved as your default."
-                             if saved else
-                             ". The config file couldn't be written, "
-                             "so tell me again after a restart."))
+                _say("Done. I'll ask out loud before real "
+                     "actions"
+                     + (", and that's saved as your default."
+                        if saved else
+                        ". The config file couldn't be written, "
+                        "so tell me again after a restart."))
             else:
-                mouth.say("I saved asking as your default, but this "
-                          "session couldn't switch over. Restart the "
-                          "voice line to get asking back.")
+                _say("I saved asking as your default, but this "
+                     "session couldn't switch over. Restart the "
+                     "voice line to get asking back.")
+        elif verb == "discordvoiceoff":
+            resp = ""
+            if not _DISCORD_VOICE["on"]:
+                _say("Discord voice is already off.")
+            else:
+                _DISCORD_VOICE["on"] = False
+                saved = _write_config_key("discord_voice", False)
+                log("[console] discord_voice -> off"
+                    + ("" if saved else " (session only)"))
+                _say(("Discord voice off, and saved as your "
+                      "default. " if saved else
+                      "Discord voice off for this session. The "
+                      "config file couldn't be written, so it "
+                      "won't stick past a restart. ")
+                     + "Say unmute discord any time to bring it "
+                       "back.")
+        elif verb == "discordvoiceon":
+            resp = ""
+            if _DISCORD_VOICE["on"]:
+                _say("Discord voice is already on.")
+            else:
+                _DISCORD_VOICE["on"] = True
+                saved = _write_config_key("discord_voice", True)
+                log("[console] discord_voice -> on"
+                    + ("" if saved else " (session only)"))
+                _say("Discord voice back on"
+                     + (", and saved as your default."
+                        if saved else
+                        " for this session. The config file "
+                        "couldn't be written, so it won't stick "
+                        "past a restart."))
         else:
             resp = ""
         if say_after:
@@ -850,18 +1196,22 @@ async def amain():
             # (confirmations, API errors); an error outranks our line
             low = (resp or "").lower()
             if resp and ("error" in low or "invalid" in low):
-                mouth.say(resp[:160])
-                log(f"[console] {verb} answered: {resp[:120]}")
+                _say(resp[:160])
             else:
-                mouth.say(say_after)
+                _say(say_after)
         signals.set_state("idle")
 
-    async def handle(text: str, spoke_from: float | None = None) -> bool:
+    async def handle(text: str, spoke_from: float | None = None,
+                      mute: bool = False) -> bool:
         """Process one utterance; returns False on quit. spoke_from is
         when the utterance STARTED (the PTT press), so an answer can be
         told apart from speech that began before the ask even existed."""
         nonlocal speak_task
-        log(f"[you]    {text}")
+        # Tagged so the Discord bridge can tell local input (voice or
+        # typed at the desk -- never visible on Discord otherwise) apart
+        # from a Discord-originated turn, which Discord already shows
+        # natively and should never be echoed back into.
+        log(f"[you{':discord' if mute else ''}]    {text}")
         # A pending spoken permission ask owns the next utterance IF
         # that utterance started after the ask was posed. Speech that
         # began earlier is the user interrupting the turn, not
@@ -892,11 +1242,11 @@ async def amain():
                     "confirm", "confirmed", "yes confirm",
                     "yes confirmed"):
                 verb = pend + ":confirmed"
-            elif not expired and not any(q in text.lower()
-                                         for q in QUIT_PHRASES):
+            elif not expired and _norm_speech(text) not in {
+                    _norm_speech(q) for q in QUIT_PHRASES}:
                 mouth.say("Staying as we are.")
                 return True
-        if any(q in text.lower() for q in QUIT_PHRASES):
+        if _norm_speech(text) in {_norm_speech(q) for q in QUIT_PHRASES}:
             if speak_task and not speak_task.done():
                 speak_task.cancel()
             mouth.shut_up()
@@ -933,8 +1283,29 @@ async def amain():
         # wait on a ResultMessage the CLI is withholding for an answer.
         _deny_pending()
         await brain.reset_turn()
-        speak_task = asyncio.create_task(speak_reply(brain, mouth, text))
+        speak_task = asyncio.create_task(speak_reply(brain, mouth, text, mute=mute))
         return True
+
+    # The static CFG["greeting"] already played as dead-air filler while
+    # the models warmed up. This is the REAL opening line: a genuine
+    # turn to the brain so it can speak its actual welcome-line greeting
+    # (time-aware, varied register, pulling continuity from the vault)
+    # before waiting on the person. Routed through speak_task like any
+    # other turn so PTT can interrupt it mid-sentence same as always.
+    signals.set_state("thinking")
+    # Audible bridge over the vault-read silence: the static CFG["greeting"]
+    # already played, but the REAL turn below still has to read the vault
+    # index, daily notes, and priorities live before it can speak anything
+    # personalized -- that's real seconds of silence with the face just
+    # sitting on "thinking". This one line fills that gap so it reads as
+    # "working" instead of "hung". Queued, not blocking; speak_task's own
+    # chunks queue in right behind it.
+    mouth.say_chunk("One moment, pulling up where we left off.")
+    speak_task = asyncio.create_task(speak_reply(
+        brain, mouth,
+        "(Session start. This is the first thing I'll hear from you — "
+        "give your opening welcome-line greeting now, then stop and "
+        "wait for me.)"))
 
     try:
         # ONE loop, two mic modes, switchable live (_MIC). The talk key
@@ -980,7 +1351,10 @@ async def amain():
                 waiters, return_when=asyncio.FIRST_COMPLETED)
             if typed_fut in done:
                 text = typed_fut.result(); typed_fut = None
-                if text and not await handle(text):
+                mute = text.startswith("\x01")
+                if mute:
+                    text = text[1:]
+                if text and not await handle(text, mute=mute):
                     return
                 continue
             if mic_fut is not None and mic_fut in done:
@@ -1111,6 +1485,23 @@ def main():
         asyncio.run(amain())
     except KeyboardInterrupt:
         print("\n[backtalk] interrupted — hanging up", flush=True)
+    except Exception:
+        # 2026-10-04: an oversized-tool-result crash in speak_reply
+        # recovered its own turn cleanly (logged, drained, reconnected),
+        # but something downstream still threw past that narrower catch,
+        # and this top-level handler used to only catch KeyboardInterrupt
+        # -- so the whole interpreter died with nothing in the log
+        # explaining why. Log the real traceback, then exit nonzero so
+        # the launcher's own retry loop (fullstack-agent\start.bat)
+        # relaunches a genuinely fresh process. Deliberately NOT retried
+        # in-process: amain()
+        # spawns daemon threads (typed-input reader, Discord bridge,
+        # face-mute watcher) that aren't safe to double-spawn within one
+        # interpreter -- a fresh OS process is the only re-entrant-safe
+        # restart.
+        log(f"[backtalk] uncaught exception killed the session:\n"
+            f"{traceback.format_exc()}")
+        sys.exit(1)
 
 
 if __name__ == "__main__":
