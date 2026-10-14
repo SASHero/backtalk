@@ -46,6 +46,7 @@ except ImportError:                       # older SDKs: nothing to silence
 from backtalk import signals
 from backtalk.config import CFG, DISCIPLINE
 from backtalk.vlog import log
+from backtalk.hermes_workers import HermesWorkers, ROOT as HERMES_ROOT
 
 _SENTENCE_END = re.compile(r"(?<=[.!?])\s")
 
@@ -240,9 +241,32 @@ class WarmBrain:
         self._announced: set = set()       # dedup on the REAL task_id
         self._ann_pending: list = []
         self._ann_event = asyncio.Event()
-        # An unprompted follow-up turn being collected right now.
+        self._hermes = HermesWorkers(
+            HERMES_ROOT / "profiles/jarvis-workers/jobs", self._hermes_changed)
+        self._hermes_mcp = self._hermes.mcp_server()
+        # An unprompted SDK follow-up turn being collected right now.
         self._orphan_text: list = []
         self._orphan_active = False
+
+    def _hermes_changed(self, job):
+        """External jobs share the queue, but are not fabricated SDK messages."""
+        tid = "hermes:" + job["id"]
+        if job["status"] == "running":
+            self._outstanding.add(tid)
+            return
+        self._outstanding.discard(tid)
+        if self._hermes.closed or tid in self._announced:
+            return
+        self._announced.add(tid)
+        self._ann_pending.append({
+            "task_id": tid, "label": job["label"], "task_type": "hermes",
+            "status": job["status"],
+            # Never read worker-controlled text aloud without the orchestrator.
+            "summary": ("The Hermes worker has finished. Its result is ready for review."
+                        if job["status"] == "completed" else job.get("result") or "Worker stopped."),
+            "model_text": "",
+        })
+        self._ann_event.set()
 
     async def start(self):
         signals.set_context_usage(None)
@@ -272,6 +296,7 @@ class WarmBrain:
                 can_use_tool=self._can_use_tool,
                 add_dirs=CFG["extra_dirs"],
                 skills=CFG["visible_skills"],
+                mcp_servers={"hermes-workers": self._hermes_mcp},
                 resume=rid,
             )
         if resume:
@@ -327,10 +352,13 @@ class WarmBrain:
         self._slot = None
         self._turn_gen = 0
         self._tasks_seen.clear()
-        self._outstanding.clear()
-        self._announced.clear()
-        self._ann_pending.clear()
+        self._outstanding = {tid for tid in self._outstanding if tid.startswith("hermes:")}
+        self._announced = {tid for tid in self._announced if tid.startswith("hermes:")}
+        self._ann_pending[:] = [item for item in self._ann_pending
+                               if item["task_id"].startswith("hermes:")]
         self._ann_event.clear()
+        if self._ann_pending:
+            self._ann_event.set()
         self._orphan_text.clear()
         self._orphan_active = False
         # The client is bound into the coroutine rather than read off
@@ -911,6 +939,7 @@ class WarmBrain:
 
     async def stop(self):
         signals.set_context_usage(None)
+        await self._hermes.close()
         await self._stop_pump()
         if self._client:
             await self._client.disconnect()
@@ -918,6 +947,17 @@ class WarmBrain:
 
     async def ask_stream(self, utterance: str):
         """Yield complete sentences as they stream out of the model."""
+        # Only literal human input can approve the staged job. An MCP call,
+        # model claim, or a worker's returned text cannot mint approval.
+        approval = re.sub(r"[.!?]+$", "", utterance.strip()).lower()
+        if approval in {"approve hermes worker", "approve the hermes worker"}:
+            try:
+                job = self._hermes.approve()
+                utterance += ("\n(Jarvis worker control: the pending, approved Hermes task "
+                              f"has started; job_id={job['id']}. Do not start a duplicate.)")
+            except ValueError as exc:
+                yield str(exc) + ". Over to you."
+                return
         # 2026-10-12: no more automatic mid-session recycling here --
         # Patrick's own "clear"/"compact" commands are the only thing
         # that resets this conversation now. See _STALE_IDLE_SECONDS.
