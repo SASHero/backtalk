@@ -250,6 +250,17 @@ class HermesWorkers:
                             raise ValueError("Worker result is empty or too large")
                         row.update(result=text, usage=message.get("usage"), session_id=message.get("session_id"))
                         terminal = "completed" if message.get("stop_reason") == "end_turn" else "cancelled"
+                        if terminal == "cancelled":
+                            # Caught live 2026-10-15 (adversarial review):
+                            # this is NOT the same "cancelled" as Patrick
+                            # stopping the job himself. The worker still
+                            # sent a real, validated result above -- it
+                            # just didn't end on "end_turn" (its own
+                            # budget, a refusal, max_tokens, whatever).
+                            # That result deserves the same review a
+                            # "completed" one gets, not the cheap silent
+                            # path. See brain._hermes_changed.
+                            row["stopped_with_result"] = True
                     elif message.get("type") == "error":
                         raise ValueError("Hermes connection failed; inspect the standalone host diagnostic")
                     elif message.get("type") != "ready":

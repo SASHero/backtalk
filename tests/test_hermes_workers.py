@@ -376,6 +376,77 @@ class HermesAnnouncementTest(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(line)
         self.assertIn("Background task update", prompt)
 
+    async def test_cancelled_job_with_real_result_still_escalates(self):
+        """Caught live 2026-10-15 by adversarial review: a worker that ends
+        on any stop_reason other than "end_turn" still lands on status
+        "cancelled" in hermes_workers.py, but it already sent a real,
+        validated result -- hitting its own time/step budget is the
+        ordinary way this happens, not Patrick stopping it. That result
+        must escalate for review exactly like completed/failed do, not
+        take the cheap "didn't finish" path that drops it forever."""
+        from backtalk.brain import WarmBrain
+        brain = WarmBrain()
+        row = {"id": self.JOB_ID, "label": "Excerpt review", "status": "running"}
+        brain._hermes_changed(row)
+        row.update(status="cancelled", result=self.WORKER_TEXT,
+                   stopped_with_result=True)
+        brain._hermes_changed(row)
+        item = brain._ann_pending[0]
+        self.assertTrue(item["needs_review"])
+        from backtalk.main import _compose_announcement
+        line, prompt = _compose_announcement([item])
+        self.assertIsNone(line)
+        self.assertIn("mcp__hermes-workers__result", prompt)
+        self.assertIn(self.JOB_ID, prompt)
+
+    async def test_genuinely_cancelled_job_without_result_stays_cheap(self):
+        """The counterpart to the test above: Patrick stopping a job
+        himself (no stopped_with_result flag) must still take the cheap
+        path -- this fix narrows the cheap case, it doesn't remove it."""
+        from backtalk.brain import WarmBrain
+        brain = WarmBrain()
+        row = {"id": self.JOB_ID, "label": "Excerpt review", "status": "running"}
+        brain._hermes_changed(row)
+        row.update(status="cancelled", result="Hermes worker was stopped.")
+        brain._hermes_changed(row)
+        item = brain._ann_pending[0]
+        self.assertFalse(item["needs_review"])
+
+    async def test_mixed_batch_cancelled_hermes_is_not_dropped(self):
+        """Caught live 2026-10-15: a cancelled/interrupted Hermes item used
+        to vanish entirely when an SDK item in the same batch had
+        model_text -- the model_texts branch only ever looked at SDK
+        items, and brain._announced already held the Hermes tid, so it
+        never resurfaced."""
+        from backtalk.main import _compose_announcement
+        item, (_line, _prompt) = self.compose("cancelled")
+        sdk = self.sdk_item(label="Dark mode sweep",
+                             model_text="The dark mode sweep is done.")
+        line, prompt = _compose_announcement([item, sdk])
+        self.assertIsNone(prompt)
+        self.assertIn("dark mode sweep is done", line.lower())
+        self.assertIn("stopped before it finished", line)
+
+    async def test_mixed_batch_cancelled_hermes_never_reads_finished(self):
+        """Caught live 2026-10-15: a cancelled Hermes item riding alongside
+        a failed SDK item used to enter the generic escalation prompt
+        framed as "a background job you started has finished" -- which it
+        explicitly isn't, and which burns a real turn this fix was built
+        to avoid for a cancelled job."""
+        from backtalk.main import _compose_announcement
+        item, (_line, _prompt) = self.compose("cancelled")
+        failed = self.sdk_item(label="Exporter refactor", status="failed",
+                                summary="Hit an unrecoverable error.")
+        line, prompt = _compose_announcement([item, failed])
+        self.assertIsNone(line)
+        self.assertIn("Background task update", prompt)
+        self.assertIn("Exporter refactor", prompt)
+        self.assertIn("stopped before it finished", prompt)
+        # The cancelled Hermes item must never ride into the generic
+        # per-item bullet list (which would read "status cancelled" here)
+        # -- it only ever appears via its own separate cheap sentence.
+        self.assertNotIn("status cancelled", prompt)
+
 
 class AnnouncementGranularityTest(unittest.IsolatedAsyncioTestCase):
     """Caught live 2026-10-14: a running local_agent dispatch surfaces its

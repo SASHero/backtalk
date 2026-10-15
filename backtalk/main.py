@@ -593,26 +593,37 @@ def _compose_announcement(items):
     legitimately own model_text (brain._collect_orphan now refuses to
     attach any), but an SDK task coalescing into the same batch can --
     and letting that text win would skip the worker review entirely,
-    which is the whole bug."""
+    which is the whole bug.
+
+    A no-review Hermes item (cancelled/interrupted, carrying no worker
+    text) is handled as its own category, `hermes_cheap`, separately from
+    `rest`. Caught live 2026-10-15 by adversarial review: when `rest` held
+    this ALONGSIDE an SDK item, it either silently vanished (model_texts
+    only ever looked at SDK text, so the cheap item was dropped and never
+    resurfaced -- its tid was already in brain._announced) or it rode into
+    _escalation_prompt framed as "finished," which it explicitly isn't.
+    Its cheap line is now composed once, here, and appended to whichever
+    branch actually fires below -- never silently absorbed or dropped."""
     if not items:
         return None, None
     review = [i for i in items if _is_hermes(i) and i.get("needs_review")]
-    rest = [i for i in items if not (_is_hermes(i) and i.get("needs_review"))]
-    # A non-completed status forces a turn exactly as it always has --
-    # except for Hermes, where cancelled and interrupted are Patrick's own
-    # doing and need no narration back (changed 2026-10-14).
-    if review or any(str(i.get("status")) != "completed" and not _is_hermes(i)
-                     for i in rest):
+    hermes_cheap = [i for i in items if _is_hermes(i) and not i.get("needs_review")]
+    rest = [i for i in items if not _is_hermes(i)]
+    cheap_bits = [_hermes_cheap_line(i) for i in hermes_cheap]
+    # A non-completed SDK status forces a turn exactly as it always has.
+    if review or any(str(i.get("status")) != "completed" for i in rest):
         bodies = []
         if review:
             bodies.append(_hermes_escalation_prompt(review))
         if rest:
             bodies.append(_escalation_prompt(rest))
+        if cheap_bits:
+            bodies.append("Also, no review needed: " + " ".join(cheap_bits))
         # One turn either way, same as any other multi-item batch.
         return None, "\n".join(bodies)
-    model_texts = [i["model_text"] for i in items if i.get("model_text")]
+    model_texts = [i["model_text"] for i in rest if i.get("model_text")]
     if model_texts:
-        line = " ".join(model_texts).strip()
+        line = " ".join(model_texts + cheap_bits).strip()
         if "over to you" not in line.lower():
             line += " Over to you."
         return line, None
@@ -620,27 +631,37 @@ def _compose_announcement(items):
     # interrupted, which deliberately carry no summary at all, and the
     # thin-summary gate would drag them straight back into an escalation.
     if any(len(str(i.get("summary") or "")) < _THIN_SUMMARY_CHARS
-           for i in items if not _is_hermes(i)):
-        return None, _escalation_prompt(items)
+           for i in rest):
+        prompt = _escalation_prompt(rest)
+        if cheap_bits:
+            prompt += "\nAlso, no review needed: " + " ".join(cheap_bits)
+        return None, prompt
     parts = []
-    for i in items:
+    for i in rest:
         label = _spoken_task_label(i)
         # Sentence case: the label follows a full stop, and "Heads up,
         # Major. the dark-mode task finished" reads (and logs) wrong.
         label = label[:1].upper() + label[1:]
-        if _is_hermes(i):
-            # Never "finished" -- it didn't. And never the job's own
-            # `result` text, which a stopped worker may control.
-            parts.append(f"{label} was "
-                         + ("interrupted"
-                            if str(i.get("status")) == "interrupted"
-                            else "stopped")
-                         + " before it finished.")
-            continue
         parts.append(f"{label} finished. "
                      + _first_sentences(i["summary"], 2))
+    parts.extend(cheap_bits)
+    if not parts:
+        return None, None
     return ("Heads up, Major. " + " ".join(p.strip() for p in parts)
             + " Over to you."), None
+
+
+def _hermes_cheap_line(item) -> str:
+    """The one sentence for a no-review Hermes item -- cancelled or
+    interrupted, carrying no worker text. Never "finished": it didn't.
+    Shared by every branch of _compose_announcement so the phrasing can
+    never drift between them."""
+    label = _spoken_task_label(item)
+    label = label[:1].upper() + label[1:]
+    return (f"{label} was "
+            + ("interrupted" if str(item.get("status")) == "interrupted"
+               else "stopped")
+            + " before it finished.")
 
 
 def _speak_prewritten(mouth, text: str):

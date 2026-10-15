@@ -263,9 +263,18 @@ class WarmBrain:
           escalation missed by three characters EVERY time and the cheap
           path announced a review that never happened.
         - failed: the diagnostic is worth a turn (unchanged behavior).
-        - cancelled / interrupted: Patrick stopped it himself and already
-          knows why, so a cheap line is the whole truth (changed
-          2026-10-14: these used to escalate just for being != completed).
+        - cancelled / interrupted WITHOUT a worker result: Patrick stopped
+          it himself (or the process is shutting down) and already knows
+          why, so a cheap line is the whole truth.
+        - cancelled WITH a worker result (`stopped_with_result`): corrected
+          2026-10-15, caught by adversarial review before this shipped. A
+          worker that ends on any stop_reason other than "end_turn" still
+          produced a real, validated result -- hitting its own time/step
+          budget is an entirely ordinary way for that to happen, not
+          something Patrick did. The old version routed this to the cheap
+          path with a misleading "didn't finish" line and the real result
+          went unreviewed forever. This needs a turn exactly like
+          completed/failed do.
 
         NOTHING from the job row's own text is copied in. `result` is
         worker-controlled on more than the completed path -- a worker that
@@ -283,10 +292,12 @@ class WarmBrain:
             return
         self._announced.add(tid)
         status = str(job["status"])
+        needs_review = (status in ("completed", "failed")
+                         or bool(job.get("stopped_with_result")))
         self._ann_pending.append({
             "task_id": tid, "job_id": job["id"], "label": job["label"],
             "task_type": "hermes", "status": status,
-            "needs_review": status in ("completed", "failed"),
+            "needs_review": needs_review,
             "summary": "",
             # A Hermes job can never legitimately carry one: it is an
             # external process, and nothing wakes the agent for a
