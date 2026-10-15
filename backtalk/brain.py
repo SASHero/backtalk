@@ -249,7 +249,31 @@ class WarmBrain:
         self._orphan_active = False
 
     def _hermes_changed(self, job):
-        """External jobs share the queue, but are not fabricated SDK messages."""
+        """External jobs share the queue, but are not fabricated SDK messages.
+
+        The queued item carries a DECISION, not a pre-written line:
+        needs_review says whether this ending is worth a real model turn.
+
+        - completed: always. The worker's output is untrusted text from an
+          external model, so the orchestrator has to read it before a word
+          of it is spoken -- and then actually report what it says. The old
+          version wrote a fixed "its result is ready for review" summary
+          here and leaned on main.py's thin-summary gate to escalate; that
+          string is 63 characters against a 60-character threshold, so the
+          escalation missed by three characters EVERY time and the cheap
+          path announced a review that never happened.
+        - failed: the diagnostic is worth a turn (unchanged behavior).
+        - cancelled / interrupted: Patrick stopped it himself and already
+          knows why, so a cheap line is the whole truth (changed
+          2026-10-14: these used to escalate just for being != completed).
+
+        NOTHING from the job row's own text is copied in. `result` is
+        worker-controlled on more than the completed path -- a worker that
+        stops with stop_reason != "end_turn" lands on status "cancelled"
+        carrying its own raw output -- so a reviewed item fetches the real
+        thing through the MCP result tool and an unreviewed one says only
+        that it stopped.
+        """
         tid = "hermes:" + job["id"]
         if job["status"] == "running":
             self._outstanding.add(tid)
@@ -258,12 +282,15 @@ class WarmBrain:
         if self._hermes.closed or tid in self._announced:
             return
         self._announced.add(tid)
+        status = str(job["status"])
         self._ann_pending.append({
-            "task_id": tid, "label": job["label"], "task_type": "hermes",
-            "status": job["status"],
-            # Never read worker-controlled text aloud without the orchestrator.
-            "summary": ("The Hermes worker has finished. Its result is ready for review."
-                        if job["status"] == "completed" else job.get("result") or "Worker stopped."),
+            "task_id": tid, "job_id": job["id"], "label": job["label"],
+            "task_type": "hermes", "status": status,
+            "needs_review": status in ("completed", "failed"),
+            "summary": "",
+            # A Hermes job can never legitimately carry one: it is an
+            # external process, and nothing wakes the agent for a
+            # follow-up turn when it finishes. See _collect_orphan.
             "model_text": "",
         })
         self._ann_event.set()
@@ -622,6 +649,16 @@ class WarmBrain:
             return
         attached = False
         for pend in self._ann_pending:
+            if pend.get("task_type") == "hermes":
+                # NEVER a Hermes job. This text belongs to whatever woke
+                # the agent, and nothing wakes it for a Hermes job -- it's
+                # an external process the CLI knows nothing about. So an
+                # SDK task's follow-up coalescing into the same batch
+                # would get pasted onto the Hermes item and spoken as if
+                # it were about the worker, AND it would satisfy the
+                # model_text short-circuit in main._compose_announcement,
+                # skipping the completion review entirely.
+                continue
             if not pend["model_text"]:
                 pend["model_text"] = text[:1500]
                 attached = True
@@ -649,12 +686,20 @@ class WarmBrain:
 
     async def wait_for_announcements(self) -> list:
         """Park until a background task finishes, then hand over every
-        finished task as one coalesced batch."""
+        finished task as one coalesced batch.
+
+        A Hermes item counts as already satisfied: the unprompted
+        follow-up this loop is waiting for can only come from the CLI
+        waking the agent, which never happens for an external worker
+        process. Waiting on it just burned the full
+        _ANNOUNCE_FOLLOWUP_IDLE_S as dead air before every single Hermes
+        announcement."""
         await self._ann_event.wait()
         await asyncio.sleep(_ANNOUNCE_COALESCE_S)
         started = time.monotonic()
         while self._ann_pending:
-            if all(p["model_text"] for p in self._ann_pending):
+            if all(p["model_text"] or p.get("task_type") == "hermes"
+                   for p in self._ann_pending):
                 break
             waited = time.monotonic() - started
             if waited >= _ANNOUNCE_FOLLOWUP_MAX_S:
