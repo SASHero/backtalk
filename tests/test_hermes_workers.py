@@ -377,6 +377,46 @@ class HermesAnnouncementTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Background task update", prompt)
 
 
+class AnnouncementGranularityTest(unittest.IsolatedAsyncioTestCase):
+    """Caught live 2026-10-14: a running local_agent dispatch surfaces its
+    OWN internal steps (file reads, greps) as Task frames on the same
+    connection. Those used to queue for announcement same as the top-level
+    dispatch itself -- including, once, a raw file path read aloud
+    verbatim to Patrick mid-session. Only the dispatch itself should ever
+    reach the speaker; its nested steps should finish silently."""
+
+    def started(self, task_id, task_type, description="Dark mode sweep"):
+        from types import SimpleNamespace
+        return SimpleNamespace(task_id=task_id, task_type=task_type,
+                                description=description)
+
+    async def test_nested_step_finishes_silently(self):
+        from backtalk.brain import WarmBrain
+        brain = WarmBrain()
+        brain._note_task(self.started("inner-1", "tool_use",
+                                       "Reading C:\\Users\\patri\\secret.md"))
+        brain._finish_task("inner-1", "completed", "")
+        self.assertEqual(len(brain._ann_pending), 0)
+
+    async def test_top_level_dispatch_still_announces(self):
+        from backtalk.brain import WarmBrain
+        brain = WarmBrain()
+        brain._note_task(self.started("outer-1", "local_agent"))
+        brain._finish_task("outer-1", "completed", "All done, 48 tests pass.")
+        self.assertEqual(len(brain._ann_pending), 1)
+        self.assertEqual(brain._ann_pending[0]["task_id"], "outer-1")
+
+    async def test_path_like_label_never_reaches_the_speaker(self):
+        from backtalk.main import _spoken_task_label
+        for path in (r"Reading C:\Users\patri\Desktop\JARVIS\secret.md",
+                     "scripts/jarvis-config/private-notes.md"):
+            self.assertEqual(_spoken_task_label({"label": path}),
+                              "a background task")
+        # A real label with an ordinary single slash is untouched.
+        self.assertIn("Dark mode", _spoken_task_label(
+            {"label": "Dark mode sweep, before/after check"}))
+
+
 @unittest.skipUnless(os.name == "nt", "Windows process-tree integration")
 class WindowsCleanupTest(unittest.IsolatedAsyncioTestCase):
     async def test_real_child_tree_cancel_and_timeout(self):

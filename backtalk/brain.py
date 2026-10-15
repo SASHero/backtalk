@@ -601,6 +601,19 @@ class WarmBrain:
             # Finished inside the very turn that spawned it. That turn is
             # about to speak about it itself; announcing would duplicate.
             return
+        if rec.get("task_type") not in DEFERRING_TASK_TYPES:
+            # Caught live 2026-10-14: a running local_agent/local_workflow
+            # dispatch surfaces its OWN internal steps as Task frames on
+            # the same connection (file reads, greps, sub-checks). Those
+            # finish constantly and are never the thing worth a ping --
+            # only the top-level dispatch itself (the type this same gate
+            # already uses to populate _outstanding) is a real deliverable.
+            # Without this, every nested step queued for announcement,
+            # including raw descriptions (a file path, once spoken
+            # verbatim and literally read aloud to Patrick mid-session).
+            log(f"[brain] non-deliverable task finished, not announcing "
+                f"({rec.get('label') or 'unlabelled'}, {status})")
+            return
         self._ann_pending.append({
             "task_id": tid,
             "label": rec.get("label"),

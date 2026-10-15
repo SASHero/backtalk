@@ -481,6 +481,12 @@ _BG_QUIET_MAX_WAIT_S = 900.0
 # Anything that looks like an id, not a name. BLOCKING-grade rule: a raw
 # task uuid must never reach the speaker.
 _UUIDISH = re.compile(r"^[0-9a-f]{8}\b|^[0-9a-f]{8}-[0-9a-f]{4}", re.I)
+# A backslash only ever shows up in a filesystem path on this platform, and
+# a forward-slash path reads as at least two segments. BLOCKING-grade rule,
+# same as the uuid one above: a raw path must never reach the speaker.
+# Caught live 2026-10-14 -- a subagent's own internal "reading <path>" task
+# description got spoken to Patrick verbatim, backslashes and all.
+_PATHISH = re.compile(r"\\|/[\w.-]+/[\w.-]+")
 _SENTENCE_SPLIT = re.compile(r"(?<=[.!?])\s+")
 
 
@@ -491,9 +497,9 @@ def _spoken_task_label(item) -> str:
     the only task frame that carries one -- TaskNotificationMessage has
     no description field at all (verified against the installed SDK's
     types.py). When there's no usable label, this says "a background
-    task": vague, but never a uuid read aloud."""
+    task": vague, but never a uuid, and never a path, read aloud."""
     label = " ".join(str(item.get("label") or "").replace("`", "").split())
-    if not label or _UUIDISH.match(label):
+    if not label or _UUIDISH.match(label) or _PATHISH.search(label):
         return "a background task"
     if len(label) > 70:
         label = label[:70].rsplit(" ", 1)[0] or label[:70]
