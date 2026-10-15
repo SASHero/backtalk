@@ -46,6 +46,7 @@ except ImportError:                       # older SDKs: nothing to silence
 from backtalk import signals
 from backtalk.config import CFG, DISCIPLINE
 from backtalk.vlog import log
+from backtalk.hermes_workers import HermesWorkers, ROOT as HERMES_ROOT
 
 _SENTENCE_END = re.compile(r"(?<=[.!?])\s")
 
@@ -70,6 +71,106 @@ SESSION_META_FILE = os.path.join(CFG["signals_dir"],
 # decision: reattach to a saved session or start clean) still uses it.
 _STALE_IDLE_SECONDS = 2 * 60 * 60
 # Token counts are retained for reporting, never used to force a reset.
+
+
+# ---- BACKGROUND TASKS: the real SDK field names, not guesses.
+#
+# Verified by reading the installed SDK's own source (claude-agent-sdk
+# 0.2.143, a tag-matched clone at reference/claude-agent-sdk-python-
+# v0.2.143). Two earlier passes at this feature guessed and got it
+# wrong, so the shapes are written down here:
+#
+#   TaskStartedMessage       task_id, description, uuid, session_id,
+#                            tool_use_id, task_type
+#   TaskProgressMessage      task_id, description, usage, uuid,
+#                            session_id, tool_use_id, last_tool_name
+#   TaskNotificationMessage  task_id, status, output_file, summary,
+#                            uuid, session_id, tool_use_id, usage
+#                            -- NO description field. The human-readable
+#                            label has to be captured from the started/
+#                            progress frames and remembered, or the only
+#                            thing left to say out loud is a raw uuid.
+#   TaskUpdatedMessage       task_id, patch (dict), status, session_id,
+#                            uuid
+#
+# TaskUpdatedMessage.status IS a real attribute in this version, but
+# message_parser.py only ever fills it from patch.get("status") -- the
+# patch is the source of truth and .status is a derived copy that is
+# None whenever the patch carried no status. So read the patch FIRST and
+# treat .status as the fallback, never the other way round.
+#
+# Terminal completion can arrive as EITHER a task_notification or a
+# task_updated patch; the SDK's own docstrings say so outright (a task
+# killed via TaskStop reports only the task_updated). Both are handled.
+try:
+    from claude_agent_sdk import TERMINAL_TASK_STATUSES
+except ImportError:                       # older SDKs: the real values
+    TERMINAL_TASK_STATUSES = frozenset(
+        {"completed", "failed", "stopped", "killed"})
+
+try:
+    # PRIVATE on purpose, and a reader should know it rather than
+    # discover it: the SDK exports no public equivalent. This is the
+    # set of task types that actually REACH a terminal status -- real
+    # delegated agent/workflow work. A background SHELL (Bash with
+    # run_in_background on a dev server, a tail -f) is reported through
+    # the very same lifecycle frames but may never report terminal at
+    # all, so anything that tracks "still outstanding" has to exclude
+    # it or the tracker wedges permanently. The SDK hit this exact wall
+    # itself -- see _track_task_lifecycle's docstring in
+    # _internal/query.py. Shells are still ANNOUNCED when they do
+    # finish; they're only kept out of the outstanding set.
+    from claude_agent_sdk._internal.query import DEFERRING_TASK_TYPES
+except Exception:
+    DEFERRING_TASK_TYPES = frozenset({"local_agent", "local_workflow"})
+
+# How long to hold a finished-task announcement before handing it over,
+# so two jobs landing seconds apart become one spoken line.
+_ANNOUNCE_COALESCE_S = 2.0
+# When a background task lands, the CLI wakes the agent for a follow-up
+# turn and the model often writes its own summary with nobody having
+# asked. That text is already paid for, so it beats anything we could
+# synthesize -- but it takes real seconds to arrive. These bound the
+# wait for it: give up early at _IDLE once nothing is streaming, or at
+# _MAX regardless. Both are judgement calls, not measurements.
+_ANNOUNCE_FOLLOWUP_IDLE_S = 6.0
+_ANNOUNCE_FOLLOWUP_MAX_S = 14.0
+# Long sessions shouldn't accumulate task bookkeeping forever.
+_TASK_MEMORY_CAP = 200
+
+
+class _TurnSlot:
+    """The single-slot turn channel: where the pump puts the messages
+    belonging to the ONE live foreground turn.
+
+    main.py already serializes every input source down to one live turn
+    at a time (handle() cancels and awaits the previous speak_task before
+    starting another), so one slot is enough -- and it reproduces
+    receive_response()'s semantics exactly, minus the shared-stream
+    off-by-one bug, because a retired turn's leftovers die with its slot
+    instead of pairing with the next question.
+    """
+    __slots__ = ("q",)
+
+    def __init__(self):
+        self.q: asyncio.Queue = asyncio.Queue()
+
+
+class _StreamFailure:
+    """Sentinel: the pump stopped feeding this slot.
+
+    exc carries the REAL exception object the SDK raised, never a
+    re-worded stand-in. That matters concretely: speak_reply's crash
+    handler does a substring check for "maximum buffer size" to tell the
+    oversized-tool-result case (a real, repeated failure on this
+    machine) apart from a generic internal error, and synthesizing a
+    tidy RuntimeError here would destroy that diagnostic. exc is None
+    ONLY for a genuinely clean end-of-stream with no underlying error.
+    """
+    __slots__ = ("exc",)
+
+    def __init__(self, exc: Exception | None):
+        self.exc = exc
 
 
 class WarmBrain:
@@ -110,6 +211,100 @@ class WarmBrain:
         # True while a query's response hasn't been consumed through its
         # ResultMessage — i.e. the shared message pipe may hold leftovers.
         self._dirty = False
+        # ---- THE PERMANENT MESSAGE PUMP.
+        # One long-lived task drains receive_messages() for the entire
+        # life of the connection and never goes idle. Not a refactor for
+        # tidiness: the SDK's own reader task routes the MCP control
+        # protocol (control_response/control_request) on the SAME loop
+        # that hands SDK messages to a bounded memory stream. Nobody
+        # draining that stream means the reader BLOCKS on send, and
+        # control responses stop being routed with it -- upstream
+        # anthropics/claude-agent-sdk-python#425. Per-turn
+        # receive_response() calls leave exactly that gap between turns.
+        self._pump: asyncio.Task | None = None
+        # Set ONLY by the pump's exit path. This is what tells "the turn
+        # retired normally" apart from "the slot was force-cleared
+        # because the stream died" -- both leave _slot None, and
+        # treating the second as healthy is how a dead connection gets
+        # announced as "the connection is ready again."
+        self._stream_dead = False
+        self._stream_error: Exception | None = None
+        self._slot: _TurnSlot | None = None
+        # Bumped per foreground turn, so a finished task can be told
+        # apart from one that finished inside the very turn that spawned
+        # it (that turn narrates its own subagents; announcing them too
+        # would be duplicate noise).
+        self._turn_gen = 0
+        # task_id -> {"label", "task_type", "gen"}
+        self._tasks_seen: dict = {}
+        self._outstanding: set = set()     # deferring-type tasks only
+        self._announced: set = set()       # dedup on the REAL task_id
+        self._ann_pending: list = []
+        self._ann_event = asyncio.Event()
+        self._hermes = HermesWorkers(
+            HERMES_ROOT / "profiles/jarvis-workers/jobs", self._hermes_changed)
+        self._hermes_mcp = self._hermes.mcp_server()
+        # An unprompted SDK follow-up turn being collected right now.
+        self._orphan_text: list = []
+        self._orphan_active = False
+
+    def _hermes_changed(self, job):
+        """External jobs share the queue, but are not fabricated SDK messages.
+
+        The queued item carries a DECISION, not a pre-written line:
+        needs_review says whether this ending is worth a real model turn.
+
+        - completed: always. The worker's output is untrusted text from an
+          external model, so the orchestrator has to read it before a word
+          of it is spoken -- and then actually report what it says. The old
+          version wrote a fixed "its result is ready for review" summary
+          here and leaned on main.py's thin-summary gate to escalate; that
+          string is 63 characters against a 60-character threshold, so the
+          escalation missed by three characters EVERY time and the cheap
+          path announced a review that never happened.
+        - failed: the diagnostic is worth a turn (unchanged behavior).
+        - cancelled / interrupted WITHOUT a worker result: Patrick stopped
+          it himself (or the process is shutting down) and already knows
+          why, so a cheap line is the whole truth.
+        - cancelled WITH a worker result (`stopped_with_result`): corrected
+          2026-10-15, caught by adversarial review before this shipped. A
+          worker that ends on any stop_reason other than "end_turn" still
+          produced a real, validated result -- hitting its own time/step
+          budget is an entirely ordinary way for that to happen, not
+          something Patrick did. The old version routed this to the cheap
+          path with a misleading "didn't finish" line and the real result
+          went unreviewed forever. This needs a turn exactly like
+          completed/failed do.
+
+        NOTHING from the job row's own text is copied in. `result` is
+        worker-controlled on more than the completed path -- a worker that
+        stops with stop_reason != "end_turn" lands on status "cancelled"
+        carrying its own raw output -- so a reviewed item fetches the real
+        thing through the MCP result tool and an unreviewed one says only
+        that it stopped.
+        """
+        tid = "hermes:" + job["id"]
+        if job["status"] == "running":
+            self._outstanding.add(tid)
+            return
+        self._outstanding.discard(tid)
+        if self._hermes.closed or tid in self._announced:
+            return
+        self._announced.add(tid)
+        status = str(job["status"])
+        needs_review = (status in ("completed", "failed")
+                         or bool(job.get("stopped_with_result")))
+        self._ann_pending.append({
+            "task_id": tid, "job_id": job["id"], "label": job["label"],
+            "task_type": "hermes", "status": status,
+            "needs_review": needs_review,
+            "summary": "",
+            # A Hermes job can never legitimately carry one: it is an
+            # external process, and nothing wakes the agent for a
+            # follow-up turn when it finishes. See _collect_orphan.
+            "model_text": "",
+        })
+        self._ann_event.set()
 
     async def start(self):
         signals.set_context_usage(None)
@@ -139,12 +334,14 @@ class WarmBrain:
                 can_use_tool=self._can_use_tool,
                 add_dirs=CFG["extra_dirs"],
                 skills=CFG["visible_skills"],
+                mcp_servers={"hermes-workers": self._hermes_mcp},
                 resume=rid,
             )
         if resume:
             try:
                 self._client = ClaudeSDKClient(options=_opts(resume))
                 await self._client.connect()
+                self._start_pump()
                 meta, self._resume_meta = self._resume_meta, None  # consume once
                 if meta:
                     self._session_started = meta.get("started_at",
@@ -171,7 +368,373 @@ class WarmBrain:
         self._last_input_tokens = 0
         self._client = ClaudeSDKClient(options=_opts(None))
         await self._client.connect()
+        self._start_pump()
         await self._publish_context_usage()
+
+    # ------------------------------------------------------------------
+    # The permanent pump, the turn channel, and the announcement queue
+    # ------------------------------------------------------------------
+
+    def _start_pump(self):
+        """Install a fresh pump over the freshly-connected client.
+
+        Also the one place every piece of per-connection state is reset,
+        so a rebuild can never inherit a dead stream's flags, a retired
+        slot, or stale task bookkeeping. _ann_event and _ann_pending are
+        CLEARED rather than rebound on purpose: main.py's announcer may
+        already be parked on that exact Event object, and swapping it
+        would orphan the waiter.
+        """
+        self._stream_dead = False
+        self._stream_error = None
+        self._slot = None
+        self._turn_gen = 0
+        self._tasks_seen.clear()
+        self._outstanding = {tid for tid in self._outstanding if tid.startswith("hermes:")}
+        self._announced = {tid for tid in self._announced if tid.startswith("hermes:")}
+        self._ann_pending[:] = [item for item in self._ann_pending
+                               if item["task_id"].startswith("hermes:")]
+        self._ann_event.clear()
+        if self._ann_pending:
+            self._ann_event.set()
+        self._orphan_text.clear()
+        self._orphan_active = False
+        # The client is bound into the coroutine rather than read off
+        # self, so a pump that outlives a rebuild by a few ticks can
+        # never read the NEW connection.
+        self._pump = asyncio.create_task(self._pump_loop(self._client))
+        self._pump.add_done_callback(self._pump_died)
+
+    async def _pump_loop(self, client):
+        """Drain the SDK's message stream forever, routing as it goes."""
+        try:
+            async for msg in client.receive_messages():
+                self._route(msg)
+        except asyncio.CancelledError:
+            raise                 # deliberate teardown; _stop_pump's job
+        except Exception as exc:
+            # The REAL exception object goes to whoever is waiting on the
+            # live turn. receive_messages() already re-raises the typed
+            # original (ProcessError/ResultError/CLIJSONDecodeError/the
+            # transport's buffer-overflow error) rather than flattening
+            # it -- see _internal/query.py's error frame -- so there is
+            # nothing to gain and a real diagnostic to lose by wrapping.
+            log(f"[brain] message pump stopped on an error: {exc!r}")
+            self._mark_stream_dead(exc)
+            return
+        # Clean EOF: the only case that genuinely has no exception to
+        # carry, so the generic "ended without ResultMessage" error is
+        # synthesized HERE and nowhere else.
+        log("[brain] message pump reached end of stream")
+        self._mark_stream_dead(None)
+
+    def _pump_died(self, task: asyncio.Task):
+        """Done-callback: the liveness backstop.
+
+        Without this, a pump that died some way the body couldn't catch
+        (a BaseException, or a cancellation from something other than
+        _stop_pump) would leave the brain silently bricked -- callers
+        parked on slot.q.get() forever, with no timeout and nothing
+        watching. Idempotent: the normal paths already marked the stream
+        dead and this leaves them alone.
+        """
+        if task is not self._pump:
+            return                # superseded by a rebuild; not ours
+        if task.cancelled():
+            return                # deliberate teardown
+        if self._stream_dead:
+            return
+        try:
+            exc = task.exception()
+        except Exception:
+            exc = None
+        log(f"[brain] message pump task exited unexpectedly: {exc!r}")
+        self._mark_stream_dead(exc if isinstance(exc, Exception) else None)
+
+    def _mark_stream_dead(self, exc: Exception | None):
+        """The ONE fail-open path that clears the live turn slot.
+
+        Everything downstream keys off _stream_dead rather than off
+        "_slot is None", precisely because this path and a clean turn
+        retirement both leave the slot empty.
+        """
+        self._stream_dead = True
+        if exc is not None and self._stream_error is None:
+            self._stream_error = exc
+        slot, self._slot = self._slot, None
+        if slot is not None:
+            try:
+                slot.q.put_nowait(_StreamFailure(exc))
+            except Exception:
+                pass
+
+    async def _stop_pump(self):
+        """Cancel the pump and wait for it, WITHOUT eating a cancellation
+        the caller needs to see.
+
+        asyncio.wait() is deliberate: it never re-raises the awaited
+        task's own CancelledError (so the expected teardown stays quiet)
+        and it does not shield us from ours (so a rebuild that is itself
+        cancelled by new input still propagates). A blanket
+        `except (CancelledError, Exception): pass` around `await task`
+        cannot tell those two apart and swallows both.
+        """
+        task, self._pump = self._pump, None
+        if task is None:
+            return
+        if not task.done():
+            task.cancel()
+        await asyncio.wait({task})
+
+    def _begin_turn(self) -> _TurnSlot:
+        """Install the turn channel for one foreground turn.
+
+        Liveness is checked HERE rather than discovered later: installing
+        a slot over a dead pump hands the caller a queue nothing will
+        ever feed, and slot.q.get() has no timeout. Raising instead sends
+        the turn down speak_reply's crash handler, which calls
+        reset_turn(), which sees _stream_dead and rebuilds -- and because
+        the stored exception is the original, the handler's
+        "maximum buffer size" check still names the real cause even one
+        turn later.
+        """
+        if self._client is None:
+            raise RuntimeError("No Claude session is connected")
+        if self._stream_dead or self._pump is None or self._pump.done():
+            if not self._stream_dead:
+                self._mark_stream_dead(None)
+            raise (self._stream_error
+                   or RuntimeError("The Claude message pump is not "
+                                   "running; the session needs "
+                                   "rebuilding"))
+        self._turn_gen += 1
+        slot = _TurnSlot()
+        self._slot = slot
+        return slot
+
+    async def _turn_stream(self, slot: _TurnSlot):
+        """receive_response()'s semantics, fed by the pump: every message
+        up to and including this turn's ResultMessage, then stop."""
+        while True:
+            item = await slot.q.get()
+            if isinstance(item, _StreamFailure):
+                if item.exc is not None:
+                    raise item.exc            # the real one, untouched
+                raise RuntimeError(
+                    "Response stream ended without ResultMessage")
+            if type(item).__name__ == "ResultMessage":
+                # Retire the slot BEFORE yielding: every caller breaks
+                # out of the loop on the ResultMessage, so code after
+                # the yield would never run.
+                if self._slot is slot:
+                    self._slot = None
+                yield item
+                return
+            yield item
+
+    # ---- routing -----------------------------------------------------
+
+    def _route(self, msg):
+        """Sort one message: live turn, announcement queue, or orphan.
+
+        Strictly synchronous -- no awaits -- so the pump keeps the SDK's
+        reader drained and the control protocol flowing.
+        """
+        t = type(msg).__name__
+        if t in ("TaskStartedMessage", "TaskProgressMessage"):
+            # Label capture. Both frames carry `description`; the
+            # terminal notification does NOT, so if this is skipped the
+            # only thing left to announce is a uuid.
+            self._note_task(msg)
+        elif t == "TaskNotificationMessage":
+            self._finish_task(getattr(msg, "task_id", None),
+                              getattr(msg, "status", None),
+                              getattr(msg, "summary", "") or "")
+            return                 # announcement queue only, not the turn
+        elif t == "TaskUpdatedMessage":
+            patch = getattr(msg, "patch", None)
+            status = (patch.get("status") if isinstance(patch, dict)
+                      else None) or getattr(msg, "status", None)
+            if status in TERMINAL_TASK_STATUSES:
+                self._finish_task(getattr(msg, "task_id", None), status, "")
+                return             # announcement queue only, not the turn
+        slot = self._slot
+        if slot is not None:
+            slot.q.put_nowait(msg)
+            return
+        self._collect_orphan(msg)
+
+    def _note_task(self, msg):
+        tid = getattr(msg, "task_id", None)
+        if not tid:
+            return
+        rec = self._tasks_seen.get(tid)
+        if rec is None:
+            if len(self._tasks_seen) >= _TASK_MEMORY_CAP:
+                for old in list(self._tasks_seen)[:_TASK_MEMORY_CAP // 2]:
+                    self._tasks_seen.pop(old, None)
+            rec = {"label": None, "task_type": None, "gen": self._turn_gen}
+            self._tasks_seen[tid] = rec
+        desc = (getattr(msg, "description", None) or "").strip()
+        if desc and not rec["label"]:
+            rec["label"] = desc[:160]
+        ttype = getattr(msg, "task_type", None)
+        if ttype:
+            rec["task_type"] = ttype
+        if ttype in DEFERRING_TASK_TYPES:
+            # Only delegated agent/workflow work goes in here -- a
+            # background shell may never report terminal at all.
+            self._outstanding.add(tid)
+
+    def _finish_task(self, tid, status, summary: str):
+        if not tid:
+            return
+        self._outstanding.discard(tid)
+        status = str(status) if status else "completed"
+        summary = (summary or "").strip()
+        # Terminal state can arrive twice (a task_updated patch and then
+        # the richer task_notification, or the reverse). Merge into the
+        # entry still waiting rather than dropping the one that actually
+        # carries the summary.
+        for pend in self._ann_pending:
+            if pend["task_id"] == tid:
+                if summary and not pend["summary"]:
+                    pend["summary"] = summary
+                pend["status"] = status
+                return
+        if tid in self._announced:
+            return                  # dedup on the real id, never a label
+        if len(self._announced) >= _TASK_MEMORY_CAP:
+            self._announced.clear()
+        self._announced.add(tid)
+        rec = self._tasks_seen.get(tid) or {}
+        if self._slot is not None and rec.get("gen") == self._turn_gen:
+            # Finished inside the very turn that spawned it. That turn is
+            # about to speak about it itself; announcing would duplicate.
+            return
+        if rec.get("task_type") not in DEFERRING_TASK_TYPES:
+            # Caught live 2026-10-14: a running local_agent/local_workflow
+            # dispatch surfaces its OWN internal steps as Task frames on
+            # the same connection (file reads, greps, sub-checks). Those
+            # finish constantly and are never the thing worth a ping --
+            # only the top-level dispatch itself (the type this same gate
+            # already uses to populate _outstanding) is a real deliverable.
+            # Without this, every nested step queued for announcement,
+            # including raw descriptions (a file path, once spoken
+            # verbatim and literally read aloud to Patrick mid-session).
+            log(f"[brain] non-deliverable task finished, not announcing "
+                f"({rec.get('label') or 'unlabelled'}, {status})")
+            return
+        self._ann_pending.append({
+            "task_id": tid,
+            "label": rec.get("label"),
+            "task_type": rec.get("task_type"),
+            "status": status,
+            "summary": summary,
+            "model_text": "",
+        })
+        self._ann_event.set()
+        log(f"[brain] background task finished "
+            f"({rec.get('label') or 'unlabelled'}, {status})")
+
+    def _collect_orphan(self, msg):
+        """Collect an UNPROMPTED turn -- one nobody asked for.
+
+        When a background task lands, the CLI wakes the agent for a
+        follow-up turn, and the model frequently writes its own account
+        of what happened. No slot is installed for it (nothing here
+        queried), so without this it lands nowhere. Preferring that text
+        over anything synthesized is the cheap path done right: the
+        tokens are already spent either way.
+        """
+        t = type(msg).__name__
+        if t in ("AssistantMessage", "StreamEvent"):
+            self._orphan_active = True
+        if t == "AssistantMessage":
+            for b in getattr(msg, "content", []) or []:
+                txt = getattr(b, "text", None)
+                if txt:
+                    self._orphan_text.append(txt)
+            return
+        if t != "ResultMessage":
+            return
+        text = " ".join(" ".join(self._orphan_text).split()).strip()
+        self._orphan_text.clear()
+        self._orphan_active = False
+        try:
+            # Honest bookkeeping: this turn cost real tokens even though
+            # nobody here asked for it. Not counted as a conversation
+            # turn, same treatment console commands get.
+            self._tally(msg, count_turn=False)
+            self._remember_session(msg)
+        except Exception:
+            pass
+        if not text:
+            return
+        attached = False
+        for pend in self._ann_pending:
+            if pend.get("task_type") == "hermes":
+                # NEVER a Hermes job. This text belongs to whatever woke
+                # the agent, and nothing wakes it for a Hermes job -- it's
+                # an external process the CLI knows nothing about. So an
+                # SDK task's follow-up coalescing into the same batch
+                # would get pasted onto the Hermes item and spoken as if
+                # it were about the worker, AND it would satisfy the
+                # model_text short-circuit in main._compose_announcement,
+                # skipping the completion review entirely.
+                continue
+            if not pend["model_text"]:
+                pend["model_text"] = text[:1500]
+                attached = True
+        if attached:
+            self._ann_event.set()
+        else:
+            log(f"[brain] unprompted follow-up with nothing pending: "
+                f"{text[:140]}")
+
+    # ---- the announcement queue, read by main.py ---------------------
+
+    def has_outstanding_tasks(self) -> bool:
+        """True while a delegated agent/workflow task is still running.
+
+        GUARD POINT, left here deliberately: there is no context
+        recycler in this build (Patrick removed the mid-session
+        auto-recycle 2026-10-12). If one is ever added back, it must
+        consult this before clearing the conversation -- wiping context
+        out from under an outstanding background task destroys the
+        agent's ability to say anything useful when it lands. Only
+        deferring task types count; a background shell may never report
+        terminal and would wedge this True forever.
+        """
+        return bool(self._outstanding)
+
+    async def wait_for_announcements(self) -> list:
+        """Park until a background task finishes, then hand over every
+        finished task as one coalesced batch.
+
+        A Hermes item counts as already satisfied: the unprompted
+        follow-up this loop is waiting for can only come from the CLI
+        waking the agent, which never happens for an external worker
+        process. Waiting on it just burned the full
+        _ANNOUNCE_FOLLOWUP_IDLE_S as dead air before every single Hermes
+        announcement."""
+        await self._ann_event.wait()
+        await asyncio.sleep(_ANNOUNCE_COALESCE_S)
+        started = time.monotonic()
+        while self._ann_pending:
+            if all(p["model_text"] or p.get("task_type") == "hermes"
+                   for p in self._ann_pending):
+                break
+            waited = time.monotonic() - started
+            if waited >= _ANNOUNCE_FOLLOWUP_MAX_S:
+                break
+            if not self._orphan_active and waited >= _ANNOUNCE_FOLLOWUP_IDLE_S:
+                break
+            await asyncio.sleep(0.5)
+        items = list(self._ann_pending)
+        self._ann_pending.clear()
+        self._ann_event.clear()
+        return items
 
     async def set_permission_mode(self, backtalk_mode: str):
         """Live flip, no reconnect, conversation intact ("ask" maps to
@@ -315,6 +878,7 @@ class WarmBrain:
         stream is not trusted to always deliver, and an unbounded await
         here would deafen the whole voice loop. On timeout the pipe is
         left marked dirty so the next reset_turn drains or rebuilds."""
+        slot = self._begin_turn()
         self._dirty = True
         # Clear/compact/model commands may change the context or its capacity.
         signals.set_context_usage(None)
@@ -322,7 +886,7 @@ class WarmBrain:
         texts = []
 
         async def _collect():
-            async for msg in self._client.receive_response():
+            async for msg in self._turn_stream(slot):
                 t = type(msg).__name__
                 if t == "AssistantMessage":
                     for b in getattr(msg, "content", []) or []:
@@ -361,9 +925,32 @@ class WarmBrain:
         answers the PREVIOUS question — for the rest of the session.
         So: interrupt the dead turn, then drain the pipe through its
         stale ResultMessage before the next query goes out. No-op when
-        the last turn was consumed clean."""
+        the last turn was consumed clean.
+
+        With the permanent pump in place the drain reads the dead turn's
+        OWN slot rather than a shared stream, so the leftovers can't be
+        mistaken for the next question's answer. The pump keeps the SDK
+        reader drained throughout, so the drain can never deadlock
+        against the control protocol."""
+        # FIRST, before any early return: a dead stream also leaves the
+        # slot empty, and "empty slot" is exactly what a clean turn
+        # retirement looks like. Checking _dirty/_slot first would
+        # diagnose a dead connection as healthy and let speak_reply's
+        # handler tell Patrick "the connection is ready again" about a
+        # brain that answers nothing.
+        if self._stream_dead:
+            log("[brain] the message pump is dead — rebuilding rather "
+                "than reporting a false recovery")
+            return await self._rebuild()
         if not self._client or not self._dirty:
             return
+        slot = self._slot
+        if slot is None:
+            # Marked in flight, yet its channel is gone and the pump
+            # never reported a failure. Unexplained — so don't assume
+            # healthy.
+            log("[brain] a dirty turn with no live channel — rebuilding")
+            return await self._rebuild()
         try:
             await asyncio.wait_for(self._client.interrupt(), 5)
         except Exception:
@@ -371,61 +958,87 @@ class WarmBrain:
 
         async def _drain() -> int:
             n = 0
-            async for msg in self._client.receive_response():
+            # _turn_stream raises the pump's real exception on a dead
+            # stream and returns at the ResultMessage; EOF is never
+            # mistaken for recovery.
+            async for _msg in self._turn_stream(slot):
                 n += 1
-                if type(msg).__name__ == "ResultMessage":
-                    return n
-            # EOF is not recovery: the SDK reader may have died before
-            # emitting the result that makes the shared pipe safe again.
-            raise RuntimeError("Response stream ended without ResultMessage")
+            return n
 
         try:
             drained = await asyncio.wait_for(_drain(), timeout)
             log(f"[brain] interrupted turn drained ({drained} stale messages)")
             self._dirty = False
         except Exception:
-            # Can't re-align — rebuild the session rather than run
-            # desynced. Loses this voice session's conversation memory;
-            # better than answering every question one turn late for the
-            # rest of the day.
-            log("[brain] stream desynced beyond repair — rebuilding the "
-                "session (conversation memory for this session resets)")
-            # Invalidate the failed conversation before reconnecting so
-            # even an unsuccessful rebuild cannot resume it at launch.
-            for path in (SESSION_FILE, SESSION_META_FILE):
-                try:
-                    os.remove(path)
-                except FileNotFoundError:
-                    pass
-            self._resume_id = None
+            return await self._rebuild()
+
+    async def _rebuild(self):
+        """Last resort: throw the connection away and start clean.
+
+        Loses this voice session's conversation memory; better than
+        answering every question one turn late for the rest of the day,
+        and far better than a bricked pump nobody noticed. Returns True
+        so the caller discloses the reset out loud."""
+        log("[brain] stream desynced beyond repair — rebuilding the "
+            "session (conversation memory for this session resets)")
+        # Invalidate the failed conversation before reconnecting so
+        # even an unsuccessful rebuild cannot resume it at launch.
+        for path in (SESSION_FILE, SESSION_META_FILE):
+            try:
+                os.remove(path)
+            except FileNotFoundError:
+                pass
+        self._resume_id = None
+        # Not wrapped in a swallow-everything: if THIS rebuild is itself
+        # cancelled by new input arriving, the caller has to see it.
+        await self._stop_pump()
+        if self._client is not None:
             try:
                 await asyncio.wait_for(self._client.disconnect(), 5)
             except Exception:
                 pass
-            self._client = None
-            self._resume_meta = None
-            self._session_started = time.time()
-            self._last_activity = None
-            self._last_input_tokens = 0
-            await asyncio.wait_for(self.start(), 20)
-            self._dirty = False
-            return True  # caller must disclose that conversation was reset
+        self._client = None
+        self._resume_meta = None
+        self._session_started = time.time()
+        self._last_activity = None
+        self._last_input_tokens = 0
+        await asyncio.wait_for(self.start(), 20)   # _start_pump resets the flags
+        self._dirty = False
+        return True  # caller must disclose that conversation was reset
 
     async def stop(self):
         signals.set_context_usage(None)
+        await self._hermes.close()
+        await self._stop_pump()
         if self._client:
             await self._client.disconnect()
             self._client = None
 
     async def ask_stream(self, utterance: str):
         """Yield complete sentences as they stream out of the model."""
+        # Only literal human input can approve the staged job. An MCP call,
+        # model claim, or a worker's returned text cannot mint approval.
+        approval = re.sub(r"[.!?]+$", "", utterance.strip()).lower()
+        if approval in {"approve hermes worker", "approve the hermes worker"}:
+            try:
+                job = self._hermes.approve()
+                utterance += ("\n(Jarvis worker control: the pending, approved Hermes task "
+                              f"has started; job_id={job['id']}. Do not start a duplicate.)")
+            except ValueError as exc:
+                yield str(exc) + ". Over to you."
+                return
         # 2026-10-12: no more automatic mid-session recycling here --
         # Patrick's own "clear"/"compact" commands are the only thing
         # that resets this conversation now. See _STALE_IDLE_SECONDS.
+        # Claim the turn channel BEFORE the query goes out, and let a
+        # dead pump raise here rather than hand back a queue nothing
+        # feeds. The raise lands in speak_reply's crash handler, which
+        # recovers exactly the way it already does.
+        slot = self._begin_turn()
         self._dirty = True             # in flight until its ResultMessage
         await self._client.query(utterance)
         buf = ""
-        async for msg in self._client.receive_response():
+        async for msg in self._turn_stream(slot):
             # Reassert "thinking" on every raw stream message, tool calls
             # included. This is deliberately NOT the can_use_tool gate
             # (main.py's gate()) -- found 2026-09-02 that the SDK silently
