@@ -50,6 +50,25 @@ from backtalk.hermes_workers import HermesWorkers, ROOT as HERMES_ROOT
 
 _SENTENCE_END = re.compile(r"(?<=[.!?])\s")
 
+# Confirmed live 2026-11-09, right after the orphan-text fix shipped: the
+# fix let a long reply through for the first time, and it hit the old flat
+# 1500-char cap mid-sentence, then _compose_announcement appended its own
+# "Over to you" right after the fragment -- garbled, not just short.
+_MODEL_TEXT_CHAR_LIMIT = 4000
+
+
+def _truncate_at_sentence(text: str, limit: int) -> str:
+    """Trim to at most `limit` chars without ever cutting mid-sentence --
+    a hard cut here reads as nonsense once a caller appends its own
+    closing line right after the fragment."""
+    if len(text) <= limit:
+        return text
+    cut = text[:limit]
+    boundary = 0
+    for m in _SENTENCE_END.finditer(cut):
+        boundary = m.end()
+    return (cut[:boundary] if boundary else cut).rstrip()
+
 
 SESSION_FILE = os.path.join(CFG["signals_dir"], ".backtalk_session")
 # Durable companion to SESSION_FILE: started_at/last_activity/
@@ -684,7 +703,8 @@ class WarmBrain:
                 # skipping the completion review entirely.
                 continue
             if not pend["model_text"]:
-                pend["model_text"] = text[:1500]
+                pend["model_text"] = _truncate_at_sentence(
+                    text, _MODEL_TEXT_CHAR_LIMIT)
                 attached = True
         if attached:
             self._ann_event.set()
@@ -707,7 +727,8 @@ class WarmBrain:
                 "task_type": None,
                 "status": "completed",
                 "summary": "",
-                "model_text": text[:1500],
+                "model_text": _truncate_at_sentence(
+                    text, _MODEL_TEXT_CHAR_LIMIT),
             })
             self._ann_event.set()
 

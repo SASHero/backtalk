@@ -354,6 +354,26 @@ class HermesAnnouncementTest(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(prompt)
         self.assertIn("worth a read", line)
 
+    async def test_long_orphan_followup_is_not_cut_mid_sentence(self):
+        """Confirmed live 2026-11-09, right after the drop fix shipped:
+        the old flat 1500-char cap cut a real reply off mid-word, then
+        _compose_announcement appended its own "Over to you" right after
+        the fragment -- garbled, not just short. A real multi-paragraph
+        reply must now survive whole."""
+        from backtalk.brain import WarmBrain, _MODEL_TEXT_CHAR_LIMIT
+        from backtalk.main import _compose_announcement
+        brain = WarmBrain()
+        long_reply = ("Sentence one is here. Sentence two follows. " * 60
+                      + "What I actually think about it comes last.")
+        self.assertGreater(len(long_reply), 1500)
+        brain._collect_orphan(AssistantMessage(long_reply))
+        brain._collect_orphan(ResultMessage())
+        item = brain._ann_pending[0]
+        self.assertLessEqual(len(item["model_text"]), _MODEL_TEXT_CHAR_LIMIT)
+        self.assertTrue(item["model_text"].rstrip().endswith((".", "!", "?")))
+        line, _prompt = _compose_announcement(list(brain._ann_pending))
+        self.assertNotIn("What I a Over to you", line)
+
     async def test_hermes_only_batch_does_not_wait_for_a_followup(self):
         import backtalk.brain as brain_mod
         brain, _item = self.queue("completed")
