@@ -331,6 +331,29 @@ class HermesAnnouncementTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("mcp__hermes-workers__result", prompt)
         self.assertIn("Dark mode sweep", prompt)   # same turn covers both
 
+    async def test_orphan_followup_with_nothing_pending_still_reaches_the_user(self):
+        """Confirmed live 2026-11-09: a backgrounded, non-deliverable task
+        (a plain shell, not a DEFERRING_TASK_TYPES job) finishes without
+        ever creating a pending record, then wakes a real SDK follow-up
+        turn. That follow-up text used to just get logged and dropped --
+        already paid for, never spoken, never reaching Patrick at all.
+        It now gets its own minimal pending slot instead."""
+        from backtalk.brain import WarmBrain
+        from backtalk.main import _compose_announcement
+        brain = WarmBrain()
+        self.assertEqual(brain._ann_pending, [])
+        brain._collect_orphan(
+            AssistantMessage("Full analysis of the video, worth a read."))
+        brain._collect_orphan(ResultMessage())
+        self.assertEqual(len(brain._ann_pending), 1)
+        item = brain._ann_pending[0]
+        self.assertIn("worth a read", item["model_text"])
+        self.assertNotEqual(item.get("task_type"), "hermes")
+        self.assertTrue(brain._ann_event.is_set())
+        line, prompt = _compose_announcement(list(brain._ann_pending))
+        self.assertIsNone(prompt)
+        self.assertIn("worth a read", line)
+
     async def test_hermes_only_batch_does_not_wait_for_a_followup(self):
         import backtalk.brain as brain_mod
         brain, _item = self.queue("completed")

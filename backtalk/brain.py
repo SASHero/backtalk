@@ -689,8 +689,27 @@ class WarmBrain:
         if attached:
             self._ann_event.set()
         else:
-            log(f"[brain] unprompted follow-up with nothing pending: "
-                f"{text[:140]}")
+            # No pending record to carry this home -- e.g. the background
+            # task that woke this turn was itself non-deliverable (a plain
+            # backgrounded shell, not a DEFERRING_TASK_TYPES job), so
+            # _finish_task never created one. Dropping real, already-paid-
+            # for model text here is worse than the duplicate-announcement
+            # risk this guards against elsewhere: confirmed live
+            # 2026-11-09, a full analysis turn vanished silently (backgrounded
+            # `/watch` calls woke a follow-up turn with nothing pending to
+            # attach to, twice in one session). Give it its own minimal
+            # pending record instead of just logging it into the void.
+            log(f"[brain] unprompted follow-up with nothing pending -- "
+                f"giving it its own slot: {text[:140]}")
+            self._ann_pending.append({
+                "task_id": f"orphan:{time.monotonic()}",
+                "label": None,
+                "task_type": None,
+                "status": "completed",
+                "summary": "",
+                "model_text": text[:1500],
+            })
+            self._ann_event.set()
 
     # ---- the announcement queue, read by main.py ---------------------
 
